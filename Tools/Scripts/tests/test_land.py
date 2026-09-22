@@ -177,8 +177,13 @@ class LandEndToEndTest(unittest.TestCase):
         self.remote_git('update-ref', 'refs/pull/5/head', self.git('rev-parse', 'HEAD'))
 
     def land(self):
+        # the queue runs under its own git identity (github-actions[bot] in the
+        # workflow), which must not end up on the landed commits
+        environment = {**self.environment,
+                       'GIT_COMMITTER_NAME': 'queue-runner', 'GIT_COMMITTER_EMAIL': 'queue@example.com',
+                       'GIT_AUTHOR_NAME': 'queue-runner', 'GIT_AUTHOR_EMAIL': 'queue@example.com'}
         return subprocess.run([sys.executable, str(GIT_SD1), 'land', '5'], cwd=self.repository,
-                              env=self.environment, capture_output=True, text=True)
+                              env=environment, capture_output=True, text=True)
 
     def comments(self):
         return [payload['body'] for method, path, payload in FakeGitHub.requests
@@ -198,7 +203,10 @@ class LandEndToEndTest(unittest.TestCase):
         message = self.remote_git('log', '-1', '--format=%B', 'main')
         self.assertIn('Reviewed by Caleb Feng.', message)
         self.assertNotIn('OOPS', message)
-        self.assertEqual(self.remote_git('log', '-1', '--format=%an', 'main'), 'author')
+        # the person who wrote the commit is both author and committer, so github
+        # doesn't show the workflow's identity as a second name on it
+        self.assertEqual(self.remote_git('log', '-1', '--format=%an%n%cn', 'main'), 'author\nauthor')
+        self.assertEqual(self.remote_git('log', '-1', '--format=%ae%n%ce', 'main'), 'author@example.com\nauthor@example.com')
         # the pull request branch was moved to exactly what landed, so github can mark it merged
         self.assertEqual(self.remote_git('rev-parse', 'eng/fusion'), self.remote_git('rev-parse', 'main'))
 

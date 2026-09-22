@@ -415,8 +415,8 @@ def with_reviewer(message, line):
     return '\n'.join(line if existing == REVIEWER_PLACEHOLDER else existing for existing in lines)
 
 
-def git_or_refuse(reason, *arguments):
-    result = subprocess.run(['git', *arguments], capture_output=True, text=True)
+def git_or_refuse(reason, *arguments, environment=None):
+    result = subprocess.run(['git', *arguments], capture_output=True, text=True, env=environment)
     if result.returncode:
         raise LandingRefused(f'{reason}\n\n```\n{(result.stderr or result.stdout).strip()}\n```')
     return result.stdout.strip()
@@ -463,17 +463,23 @@ def land_pull_request(number, token, owner, repository_name):
         listed = '\n'.join(f'    {line}' for line in placeholders)
         raise LandingRefused(f'these lines still need filling in (fix them with `git-sd1 amend` and `git-sd1 pr`):\n\n```\n{listed}\n```')
 
-    # replay the rebased commits with the reviewer line filled in. author and
-    # author date carry over; the committer is whoever runs the landing
+    # replay the rebased commits with the reviewer line filled in. each commit
+    # keeps its author, and is committed as that same person, so landing doesn't
+    # add whoever (or whatever) ran the queue as a second name on github
     line = reviewer_line(approver_names)
     git_or_refuse('couldn\'t rewrite the commits.', 'checkout', '--quiet', '--detach', upstream)
     for revision, message in zip(commits, messages):
-        git_or_refuse(f'couldn\'t replay {revision[:7]}.', 'cherry-pick', '--allow-empty', '--keep-redundant-commits', revision)
+        author_name, author_email, author_date = git_output('log', '-1', '--format=%an%n%ae%n%aI', revision).split('\n')
+        environment = {**os.environ,
+                       'GIT_COMMITTER_NAME': author_name, 'GIT_COMMITTER_EMAIL': author_email,
+                       'GIT_COMMITTER_DATE': author_date}
+        git_or_refuse(f'couldn\'t replay {revision[:7]}.', 'cherry-pick', '--allow-empty', '--keep-redundant-commits',
+                      revision, environment=environment)
         with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8') as message_file:
             message_file.write(with_reviewer(message, line))
         try:
             git_or_refuse(f'couldn\'t rewrite the message of {revision[:7]}.', 'commit', '--quiet', '--amend',
-                          '--no-verify', '--cleanup=verbatim', '--file', message_file.name)
+                          '--no-verify', '--cleanup=verbatim', '--file', message_file.name, environment=environment)
         finally:
             os.unlink(message_file.name)
     landed = git_output('rev-parse', 'HEAD')

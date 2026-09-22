@@ -1,0 +1,7 @@
+*.py diff=python
+*.c diff=cpp
+*.h diff=cpp
+*.cc diff=cpp
+*.cpp diff=cpp
+*.hpp diff=cpp
+*.ino diff=cpp

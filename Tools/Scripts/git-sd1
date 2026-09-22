@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# repository helper, modeled on webkit's git-webkit. put Tools/Scripts on your
+# PATH and git also picks it up as `git sd1 <command>`.
+#
+#   git-sd1 setup                   install the repository's git hooks (rerun after they change)
+#   git-sd1 commit                  new commit from the staged changes, formatted by the hook
+#   git-sd1 commit --issue 24       also link issue 24 and use its title
+#   git-sd1 commit --update         amend the last commit and refresh its file list
+#
+# arguments `commit` doesn't recognize (-a, -v, paths, ...) go straight to git commit.
+
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+HOOKS_SOURCE = Path(__file__).resolve().parent / 'hooks'
+# written into every installed hook so reruns know which hooks they own and never
+# overwrite one a developer added by hand
+INSTALLED_MARKER = '# installed by git-sd1 setup'
+
+# names shared with hooks/prepare-commit-msg, which reads them
+UPDATE_VARIABLE = 'SD1_COMMIT_UPDATE'
+TITLE_VARIABLE = 'SD1_COMMIT_TITLE'
+ISSUE_URL_VARIABLE = 'SD1_COMMIT_ISSUE_URL'
+
+GITHUB_REMOTE_PATTERN = re.compile(r'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$')
+ISSUE_URL_PATTERN = re.compile(r'github\.com/([^/]+)/([^/]+)/issues/(\d+)')
+
+
+def git_output(*arguments):
+    result = subprocess.run(['git', *arguments], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def fail(message):
+    print(f'git-sd1: {message}', file=sys.stderr)
+    return 1
+
+
+def installed_hooks_directory():
+    # --git-path follows worktrees and core.hooksPath, so this is wherever git
+    # will actually look for hooks in this clone
+    hooks_path = git_output('rev-parse', '--git-path', 'hooks')
+    return Path(hooks_path).resolve() if hooks_path else None
+
+
+def install_hook(source, destination, force):
+    if destination.exists() and INSTALLED_MARKER not in destination.read_text(encoding='utf-8', errors='replace'):
+        if not force:
+            print(f'skipped {destination.name}: {destination} already exists and wasn\'t installed by git-sd1. '
+                  f'rerun with --force to replace it (the old one is kept as {destination.name}.backup)')
+            return False
+        shutil.copy2(destination, destination.with_name(destination.name + '.backup'))
+
+    lines = source.read_text(encoding='utf-8').splitlines(keepends=True)
+    # the shebang has to stay on the first line for git to run the hook
+    lines.insert(1, f'{INSTALLED_MARKER} from {source.relative_to(REPOSITORY_ROOT).as_posix()}; '
+                    'edit that file and rerun setup instead of editing this copy\n')
+    destination.write_text(''.join(lines), encoding='utf-8')
+    destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    print(f'installed {destination.name} -> {destination}')
+    return True
+
+
+def run_setup(options):
+    hooks_directory = installed_hooks_directory()
+    if hooks_directory is None:
+        return fail('not inside a git repository')
+    hooks_directory.mkdir(parents=True, exist_ok=True)
+    results = [install_hook(source, hooks_directory / source.name, options.force)
+               for source in sorted(HOOKS_SOURCE.iterdir()) if source.is_file()]
+    return 0 if all(results) else 1
+
+
+def github_repository():
+    remote_url = git_output('remote', 'get-url', 'origin')
+    match = GITHUB_REMOTE_PATTERN.search(remote_url or '')
+    return match.groups() if match else None
+
+
+def resolve_issue(issue_argument):
+    url_match = ISSUE_URL_PATTERN.search(issue_argument)
+    if url_match:
+        return url_match.groups()
+    if not issue_argument.lstrip('#').isdigit():
+        raise ValueError(f'--issue takes an issue number or url, not "{issue_argument}"')
+    repository = github_repository()
+    if repository is None:
+        raise ValueError('origin isn\'t a github remote, so pass the full issue url to --issue')
+    return (*repository, issue_argument.lstrip('#'))
+
+
+def fetch_issue_title(owner, repository, number):
+    request = urllib.request.Request(f'https://api.github.com/repos/{owner}/{repository}/issues/{number}',
+                                     headers={'Accept': 'application/vnd.github+json'})
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if token:
+        request.add_header('Authorization', f'Bearer {token}')
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.load(response).get('title')
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        # the commit still goes ahead with the title placeholder; a private repo
+        # answers 404 unless GITHUB_TOKEN is set
+        print(f'git-sd1: couldn\'t fetch the title of issue #{number} ({error}). '
+              'fill it in yourself, or set GITHUB_TOKEN if the repository is private', file=sys.stderr)
+        return None
+
+
+def hook_is_installed():
+    hooks_directory = installed_hooks_directory()
+    hook = hooks_directory / 'prepare-commit-msg' if hooks_directory else None
+    return bool(hook and hook.exists() and INSTALLED_MARKER in hook.read_text(encoding='utf-8', errors='replace'))
+
+
+def run_commit(options, git_arguments):
+    if options.update and options.issue:
+        return fail('--issue only applies to new commits; edit the link into the message while amending')
+    if not hook_is_installed():
+        print('git-sd1: the commit hook isn\'t installed, so the message won\'t be formatted. '
+              'run `git-sd1 setup` first', file=sys.stderr)
+
+    # start from a clean slate so values left in the shell from an earlier run
+    # can't leak into this commit
+    environment = {name: value for name, value in os.environ.items()
+                   if name not in (UPDATE_VARIABLE, TITLE_VARIABLE, ISSUE_URL_VARIABLE)}
+    command = ['git', 'commit']
+    if options.update:
+        command.append('--amend')
+        environment[UPDATE_VARIABLE] = '1'
+    if options.issue:
+        try:
+            owner, repository, number = resolve_issue(options.issue)
+        except ValueError as error:
+            return fail(str(error))
+        environment[ISSUE_URL_VARIABLE] = f'https://github.com/{owner}/{repository}/issues/{number}'
+        title = fetch_issue_title(owner, repository, number)
+        if title:
+            environment[TITLE_VARIABLE] = title
+    return subprocess.run(command + git_arguments, env=environment).returncode
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='git-sd1', description='repository helper for the 3d printing failure detector')
+    subcommands = parser.add_subparsers(dest='command', required=True)
+
+    setup_parser = subcommands.add_parser('setup', help='install the repository\'s git hooks into this clone')
+    setup_parser.add_argument('--force', action='store_true', help='replace hooks that weren\'t installed by git-sd1')
+
+    commit_parser = subcommands.add_parser('commit', help='commit with the structured message format',
+                                           epilog='any other arguments are passed to git commit')
+    commit_parser.add_argument('--update', action='store_true',
+                               help='amend the last commit and refresh its file list, keeping what you wrote')
+    commit_parser.add_argument('--issue', metavar='NUMBER_OR_URL', help='github issue to link under the title')
+
+    options, extra_arguments = parser.parse_known_args()
+    if options.command == 'setup':
+        if extra_arguments:
+            parser.error(f'unrecognized arguments: {" ".join(extra_arguments)}')
+        return run_setup(options)
+    return run_commit(options, extra_arguments)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

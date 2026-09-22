@@ -7,41 +7,53 @@
 # this is the source copy. `git-sd1 setup` installs it into .git/hooks, so rerun
 # that after editing this file.
 
+import io
 import os
 import re
 import subprocess
 import sys
+import tokenize
 from dataclasses import dataclass, field
 
 UPDATE_VARIABLE = 'SD1_COMMIT_UPDATE'
 TITLE_VARIABLE = 'SD1_COMMIT_TITLE'
 ISSUE_URL_VARIABLE = 'SD1_COMMIT_ISSUE_URL'
 
-# every unfinished placeholder carries "(OOPS!)" so one search, by a person or
+# every unfinished placeholder ends in "(OOPS!)." so one search, by a person or
 # by the github format check, finds everything still left to fill in
-TITLE_PLACEHOLDER = 'Need a short descriptive title (OOPS!).'
+TITLE_PLACEHOLDER = 'Need a short description (OOPS!).'
 REVIEWER_PLACEHOLDER = 'Reviewed by NOBODY (OOPS!).'
-DESCRIPTION_PLACEHOLDER = 'Need a description of what changed and why (OOPS!).'
+DESCRIPTION_PLACEHOLDER = 'Explanation of what changed and why (OOPS!).'
 
 SCISSORS_SUFFIX = '------------------------ >8 ------------------------'
 FILE_ENTRY_PATTERN = re.compile(r'^\* (\S[^:]*):')
 FUNCTION_LINE_PATTERN = re.compile(r'^\((.+?)\):')
 TRAILER_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9-]*: \S')
 
-CODE_EXTENSIONS = {'.py', '.js', '.jsx', '.mjs', '.ts', '.tsx', '.c', '.h', '.cc', '.cpp', '.hpp', '.ino'}
+# languages whose nesting can be read from indentation, which is how methods get
+# qualified with their class (Fusion.fuse)
+SCOPED_EXTENSIONS = {'.py', '.js', '.jsx', '.mjs', '.ts', '.tsx'}
 C_FAMILY_EXTENSIONS = {'.c', '.h', '.cc', '.cpp', '.hpp', '.ino'}
+COMMENT_PREFIXES = ('#', '//', '/*', '*')
+TEST_FILE_PATTERN = re.compile(r'(^|/)(tests?|__tests__)/|(^|/)test_[^/]*\.py$|_test\.py$|\.(test|spec)\.[jt]sx?$')
+HUNK_HEADER_PATTERN = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$')
 
-# only definitions count on lines the diff adds or removes, otherwise every call
-# like `send_command(pause)` inside a function body would be listed as a change
+CLASS_PATTERN = re.compile(r'^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)')
+# only definitions count, otherwise every call like `send_command(pause)` inside
+# a function body would be listed as a change
 DEFINITION_PATTERNS = [
     re.compile(r'^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)'),
-    re.compile(r'^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)'),
+    CLASS_PATTERN,
     re.compile(r'^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)'),
     re.compile(r'^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*'
                r'(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=]+)?=>'),
+    # javascript/typescript class methods like `async start(printerId: string) {`
+    re.compile(r'^\s*(?:(?:public|private|protected|static|async|get|set|override|readonly)\s+)*'
+               r'(?!(?:if|for|while|switch|catch|function|return)\b)([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::[^{]+)?\{\s*$'),
 ]
 # hunk headers for c code look like "static int home_axis(struct stepper *motor)"
-C_FUNCTION_PATTERN = re.compile(r'([A-Za-z_]\w*)\s*\([^;]*$')
+# or "void Stepper::home(int axis)"; the qualified name is kept whole
+C_FUNCTION_PATTERN = re.compile(r'([A-Za-z_~][\w:~]*)\s*\([^;]*$')
 C_KEYWORDS = {'if', 'for', 'while', 'switch', 'return', 'sizeof', 'catch'}
 
 
@@ -51,6 +63,7 @@ class Change:
     path: str
     old_path: str = None
     functions: list = field(default_factory=list)
+    deleted_functions: list = field(default_factory=list)
 
 
 @dataclass
@@ -104,15 +117,22 @@ def staged_changes(base):
 
 
 def parse_hunks(diff_text):
+    # returns (context, removed line numbers, added line numbers, changed text) per
+    # hunk. with -U0 every line in a hunk is a change, so the counts in the header
+    # say exactly which old and new lines were touched
     hunks = []
     for line in diff_text.splitlines():
-        if line.startswith('@@'):
-            parts = line.split('@@', 2)
-            hunks.append((parts[2].strip() if len(parts) == 3 else '', []))
+        match = HUNK_HEADER_PATTERN.match(line)
+        if match:
+            old_start, old_count, new_start, new_count, context = match.groups()
+            old_count = 1 if old_count is None else int(old_count)
+            new_count = 1 if new_count is None else int(new_count)
+            hunks.append((context.strip(), range(int(old_start), int(old_start) + old_count),
+                          range(int(new_start), int(new_start) + new_count), []))
         # the "+++"/"---" file header comes before the first hunk, so anything
         # starting with +/- after a hunk has begun is a real changed line
         elif hunks and line.startswith(('+', '-')):
-            hunks[-1][1].append(line[1:])
+            hunks[-1][3].append(line[1:])
     return hunks
 
 
@@ -124,38 +144,144 @@ def definition_name(line):
     return None
 
 
-def context_name(context, extension):
-    name = definition_name(context)
-    if name or extension not in C_FAMILY_EXTENSIONS:
-        return name
-    match = C_FUNCTION_PATTERN.search(context)
-    if match and match.group(1) not in C_KEYWORDS:
-        return match.group(1)
-    return None
+def python_string_lines(lines):
+    # line numbers (0-based) that sit inside a multi-line python string, where
+    # sample code like a quoted "class Fake:" isn't real code. python's own
+    # tokenizer is used because counting quote marks gets fooled by a triple
+    # quote inside an ordinary string
+    inside = set()
+    open_fstrings = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO('\n'.join(lines) + '\n').readline):
+            token_name = tokenize.tok_name[token.type]
+            # python 3.12+ splits f-strings into start/middle/end tokens
+            if token_name == 'FSTRING_START':
+                open_fstrings.append(token.start[0])
+                continue
+            if token_name == 'FSTRING_END' and open_fstrings:
+                start_row = open_fstrings.pop()
+            elif token.type == tokenize.STRING:
+                start_row = token.start[0]
+            else:
+                continue
+            inside.update(range(start_row, token.end[0]))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        # a file that doesn't tokenize (mid-edit, python 2) just gets no string skipping
+        return set()
+    return inside
 
 
-def functions_from_diff(diff_text, extension):
+def enclosing_definitions(lines, extension='.py'):
+    # maps every line to the qualified name of the innermost definition around
+    # it ("Fusion.fuse" for a line in Fusion's fuse method), and collects every
+    # qualified name defined in the file. classes qualify the names
+    # inside them but a function nested in another function counts as part of it
+    stack = []
+    scope_by_line = []
+    defined = set()
+    string_lines = python_string_lines(lines) if extension == '.py' else set()
+    for line_number, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and line_number not in string_lines and not stripped.startswith(COMMENT_PREFIXES):
+            indent = len(line) - len(line.lstrip())
+            # a closing bracket at the definition's own indent still belongs to it,
+            # like the "}" ending a javascript function
+            closes_scope = stripped[0] in ')]}'
+            while stack and (indent < stack[-1][0] or (indent == stack[-1][0] and not closes_scope)):
+                stack.pop()
+            name = definition_name(line)
+            inside_function = any(not is_class for _, _, is_class in stack)
+            if name and not inside_function:
+                stack.append((indent, name, bool(CLASS_PATTERN.match(line))))
+                defined.add('.'.join(entry[1] for entry in stack))
+        scope_by_line.append('.'.join(entry[1] for entry in stack) or None)
+    return scope_by_line, defined
+
+
+def scoped_functions(diff_text, old_lines, new_lines, extension='.py'):
+    old_scopes, old_defined = enclosing_definitions(old_lines, extension)
+    new_scopes, new_defined = enclosing_definitions(new_lines, extension)
+
+    def scope_of(number, lines, scopes):
+        # blank lines between functions carry the scope above them, so adding or
+        # removing spacing would otherwise look like an edit to that function
+        if 0 < number <= len(lines) and lines[number - 1].strip():
+            return scopes[number - 1]
+        return None
+
+    changed, deleted = [], []
+    for _, removed_numbers, added_numbers, _ in parse_hunks(diff_text):
+        for number in added_numbers:
+            name = scope_of(number, new_lines, new_scopes)
+            if name:
+                changed.append(name)
+        for number in removed_numbers:
+            name = scope_of(number, old_lines, old_scopes)
+            if name:
+                (changed if name in new_defined else deleted).append(name)
+    # functions that no longer exist are marked "Deleted."; only report the
+    # outermost removed definition, not every method of a removed class
+    deleted = [name for name in dict.fromkeys(deleted)
+               if name in old_defined and not any(name.startswith(other + '.') for other in deleted if other != name)]
+    return list(dict.fromkeys(changed)), deleted
+
+
+def c_functions(diff_text):
     names = []
-    for context, changed_lines in parse_hunks(diff_text):
-        hunk_names = [definition_name(line) for line in changed_lines]
-        # the hunk header names the definition *above* the hunk. when the hunk
-        # starts on a definition line itself, that header points at the previous
-        # function, which wasn't touched
-        starts_on_definition = bool(hunk_names) and hunk_names[0] is not None
-        if not starts_on_definition:
-            names.append(context_name(context, extension))
-        names.extend(hunk_names)
-    return list(dict.fromkeys(name for name in names if name))
+    for context, _, _, changed_lines in parse_hunks(diff_text):
+        match = C_FUNCTION_PATTERN.search(context)
+        if match and match.group(1) not in C_KEYWORDS:
+            names.append(match.group(1))
+        names.extend(name for name in map(definition_name, changed_lines) if name)
+    return list(dict.fromkeys(names)), []
+
+
+def script_extension(path):
+    # tools like Tools/Scripts/git-sd1 are python without a .py extension, so
+    # the staged copy's shebang decides which rules apply
+    first_line = run_git('show', f':{path}', check=False).stdout.partition('\n')[0]
+    if first_line.startswith('#!'):
+        for interpreter, extension in (('python', '.py'), ('node', '.js')):
+            if interpreter in first_line:
+                return extension
+    return ''
 
 
 def changed_functions(base, change):
+    # returns (changed, deleted) qualified function names
     extension = os.path.splitext(change.path)[1].lower()
+    if not extension and change.kind not in 'AD':
+        extension = script_extension(change.path)
     # a brand new or deleted file would list every function in it, which says nothing
-    if change.kind in 'AD' or extension not in CODE_EXTENSIONS:
-        return []
+    if change.kind in 'AD' or extension not in SCOPED_EXTENSIONS | C_FAMILY_EXTENSIONS:
+        return [], []
+    old_path = change.old_path or change.path
     paths = [change.old_path, change.path] if change.old_path else [change.path]
     diff_text = run_git('diff', '--cached', '-U0', '-M', '--no-color', '--no-ext-diff', base, '--', *paths).stdout
-    return functions_from_diff(diff_text, extension)
+    if extension in C_FAMILY_EXTENSIONS:
+        return c_functions(diff_text)
+    old_lines = run_git('show', f'{base}:{old_path}', check=False).stdout.splitlines()
+    new_lines = run_git('show', f':{change.path}', check=False).stdout.splitlines()
+    return scoped_functions(diff_text, old_lines, new_lines, extension)
+
+
+def component_prefix(changes):
+    # titles start with the area they touch, like "[Detection]", taken from
+    # the top-level folder when every changed file sits in the same one
+    components = {change.path.split('/')[0] for change in changes if '/' in change.path}
+    if len(components) != 1:
+        return ''
+    component = components.pop()
+    return f'[{component[:1].upper()}{component[1:]}] '
+
+
+def test_lines(changes):
+    tests = [change.path for change in changes if change.kind != 'D' and TEST_FILE_PATTERN.search(change.path)]
+    if not tests:
+        return []
+    if len(tests) == 1:
+        return [f'Test: {tests[0]}']
+    return [f'Tests: {tests[0]}'] + [f'       {test}' for test in tests[1:]]
 
 
 def entry_lines(change):
@@ -163,7 +289,8 @@ def entry_lines(change):
     header = f'* {change.path}:'
     if change.kind in notes:
         header += ' ' + notes[change.kind]
-    return [header] + [f'({name}):' for name in change.functions]
+    return ([header] + [f'({name}):' for name in change.functions]
+            + [f'({name}): Deleted.' for name in change.deleted_functions])
 
 
 def strip_trailing_blanks(lines):
@@ -213,44 +340,115 @@ def parse_message(body_lines):
     return ParsedMessage(strip_trailing_blanks(lines[:entry_start]), entries, trailers)
 
 
+def split_entry(entry):
+    # header, text written right under the header, and one block per function
+    # line holding that line plus any note lines continuing below it
+    header, leading_text, function_blocks = entry[0], [], []
+    for line in entry[1:]:
+        match = FUNCTION_LINE_PATTERN.match(line)
+        if match:
+            function_blocks.append((match.group(1), [line]))
+        elif function_blocks:
+            function_blocks[-1][1].append(line)
+        else:
+            leading_text.append(line)
+    return header, leading_text, function_blocks
+
+
+def function_note(line):
+    # text after "(name):" that the developer wrote. "Deleted." is generated by
+    # the hook and recomputed on every update, so it never counts as a note
+    note = FUNCTION_LINE_PATTERN.sub('', line, count=1).strip()
+    return '' if note == 'Deleted.' else note
+
+
+def has_notes(block):
+    return bool(function_note(block[0])) or any(line.strip() for line in block[1:])
+
+
 def merge_entry(existing, change):
+    # rebuilds the function list in the order the change touches them, reusing
+    # existing lines so the developer's notes survive. returns the entry plus the
+    # blocks with notes whose functions are no longer part of the change
     entry = strip_trailing_blanks(existing)
     # keep a blank separator line the developer put after this entry
     spacing = existing[len(entry):][:1]
-    if change.old_path and FILE_ENTRY_PATTERN.match(entry[0]).group(1) == change.old_path:
-        entry[0] = f'* {change.path}' + entry[0][len(f'* {change.old_path}'):]
+    header, leading_text, function_blocks = split_entry(entry)
+    if change.old_path and FILE_ENTRY_PATTERN.match(header).group(1) == change.old_path:
+        header = f'* {change.path}' + header[len(f'* {change.old_path}'):]
 
-    written = '\n'.join(entry)
-    missing = [name for name in change.functions if not re.search(rf'(?<![\w$]){re.escape(name)}(?![\w$])', written)]
-    last_function_line = max((position for position, line in enumerate(entry) if FUNCTION_LINE_PATTERN.match(line)), default=0)
-    entry[last_function_line + 1:last_function_line + 1] = [f'({name}):' for name in missing]
-    return entry + spacing
+    unused = list(function_blocks)
+
+    def take_block(name, deleted):
+        # an older message may name the function without its class ("fuse" for
+        # "Fusion.fuse"), so fall back to matching the last part of the name
+        short_name = re.split(r'\.|::', name)[-1]
+        for candidates in ([block for block in unused if block[0] == name],
+                           [block for block in unused if block[0] == short_name]):
+            if candidates:
+                unused.remove(candidates[0])
+                _, lines = candidates[0]
+                note = function_note(lines[0])
+                if deleted:
+                    note = f'Deleted. {note}'.strip()
+                return [f'({name}): {note}'.rstrip() if note else f'({name}):'] + lines[1:]
+        return None
+
+    # a function the developer already explains in the file's own note doesn't
+    # need a separate line
+    file_note = '\n'.join([header] + leading_text)
+
+    def explained_in_note(name):
+        return re.search(rf'(?<![\w$.:]){re.escape(name)}(?![\w$])', file_note)
+
+    function_lines = []
+    for name, fresh_line, deleted in ([(name, f'({name}):', False) for name in change.functions]
+                                      + [(name, f'({name}): Deleted.', True) for name in change.deleted_functions]):
+        block = take_block(name, deleted)
+        if block:
+            function_lines.extend(block)
+        elif not explained_in_note(name):
+            function_lines.append(fresh_line)
+    dropped = [lines for _, lines in unused if has_notes(lines)]
+    return [header] + leading_text + function_lines + spacing, dropped
 
 
 def reconcile(parsed, changes):
-    # returns the new file list plus the entries whose files left the commit, so
-    # nothing the developer wrote disappears without them seeing it
+    # returns the new file list plus whatever the developer wrote that no longer
+    # has a place in it (whole entries for files that left the commit, and noted
+    # functions the change stopped touching), so nothing disappears unseen
     remaining = dict(parsed.entries)
-    file_lines = []
+    file_lines, dropped = [], []
     for change in changes:
         existing = remaining.pop(change.path, None)
         if existing is None and change.old_path:
             existing = remaining.pop(change.old_path, None)
-        file_lines.extend(entry_lines(change) if existing is None else merge_entry(existing, change))
-    return strip_trailing_blanks(file_lines), [strip_trailing_blanks(entry) for entry in remaining.values()]
+        if existing is None:
+            file_lines.extend(entry_lines(change))
+            continue
+        merged, dropped_functions = merge_entry(existing, change)
+        file_lines.extend(merged)
+        dropped.extend(dropped_functions)
+    dropped = [strip_trailing_blanks(entry) for entry in remaining.values()] + dropped
+    return strip_trailing_blanks(file_lines), dropped
 
 
 def build_new_message(changes, title, issue_url, comment_char):
-    lines = [title or TITLE_PLACEHOLDER]
-    if issue_url:
-        lines.append(issue_url)
+    prefix = component_prefix(changes)
+    if title and not title.startswith('['):
+        title = prefix + title
+    # a github issue link is only added when there is an issue
+    lines = [title or prefix + TITLE_PLACEHOLDER] + ([issue_url] if issue_url else [])
     lines += ['', REVIEWER_PLACEHOLDER, '', DESCRIPTION_PLACEHOLDER]
+    tests = test_lines(changes)
+    if tests:
+        lines += [''] + tests
     file_lines = [line for change in changes for line in entry_lines(change)]
     if file_lines:
         lines += [''] + file_lines
     hints = [
-        'Replace every line marked (OOPS!) before pushing. The issue link under the title is',
-        'optional: `git-sd1 commit --issue <number>` fills it in along with the issue title.',
+        'Replace every line marked (OOPS!) before pushing. If this change has a github issue,',
+        '`git-sd1 commit --issue <number>` adds its link under the title and uses its title.',
         'Explain a specific file or function by writing after its colon.',
     ]
     return lines, [f'{comment_char} {hint}' for hint in hints]
@@ -269,7 +467,7 @@ def build_amended_message(body_lines, changes, comment_char):
 
     hints = [f'{comment_char} git-sd1 refreshed the file list above to match this commit.']
     if dropped:
-        hints.append(f'{comment_char} These entries were dropped because their files are no longer in the commit.')
+        hints.append(f'{comment_char} These notes were dropped because their files or functions are no longer in the commit.')
         hints.append(f'{comment_char} Copy back anything worth keeping:')
         hints += [f'{comment_char}    {line}' for entry in dropped for line in entry]
     return lines, hints
@@ -296,7 +494,7 @@ def main(message_path, source='', commit_sha=''):
             base = diff_base(amending=True)
             changes = staged_changes(base)
             for change in changes:
-                change.functions = changed_functions(base, change)
+                change.functions, change.deleted_functions = changed_functions(base, change)
             lines, hints = build_amended_message(body, changes, comment_char)
     else:
         if any(line.strip() for line in body):
@@ -304,7 +502,7 @@ def main(message_path, source='', commit_sha=''):
         base = diff_base(amending=False)
         changes = staged_changes(base)
         for change in changes:
-            change.functions = changed_functions(base, change)
+            change.functions, change.deleted_functions = changed_functions(base, change)
         lines, hints = build_new_message(changes, os.environ.get(TITLE_VARIABLE), os.environ.get(ISSUE_URL_VARIABLE), comment_char)
 
     # git sets GIT_EDITOR=: for hooks when no editor will open (--no-edit), and

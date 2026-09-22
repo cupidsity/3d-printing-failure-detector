@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# repository helper, modeled on webkit's git-webkit. put Tools/Scripts on your
-# PATH and git also picks it up as `git sd1 <command>`.
+# repository helper for commits and pull requests. put Tools/Scripts on your PATH
+# to run it as `git-sd1 <command>` from anywhere; setup prints the line to add.
+# setup also installs a `git sd1` alias as a fallback for clones not on the PATH.
 #
 #   git-sd1 setup                   install the repository's git hooks (rerun after they change)
 #   git-sd1 commit                  new commit from the staged changes, formatted by the hook
 #   git-sd1 commit --issue 24       also link issue 24 and use its title
 #   git-sd1 commit --update         amend the last commit and refresh its file list
+#   git-sd1 pr                      commit anything staged, push, and open or update the pull request
 #
 # arguments `commit` doesn't recognize (-a, -v, paths, ...) go straight to git commit.
 
@@ -18,7 +20,9 @@ import stat
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -26,19 +30,37 @@ HOOKS_SOURCE = Path(__file__).resolve().parent / 'hooks'
 # written into every installed hook so reruns know which hooks they own and never
 # overwrite one a developer added by hand
 INSTALLED_MARKER = '# installed by git-sd1 setup'
+# git runs "!" aliases from the top of the work tree, so a relative path to the
+# script works from any subdirectory and always runs this clone's own copy
+GIT_ALIAS = '!Tools/Scripts/git-sd1'
 
 # names shared with hooks/prepare-commit-msg, which reads them
 UPDATE_VARIABLE = 'SD1_COMMIT_UPDATE'
 TITLE_VARIABLE = 'SD1_COMMIT_TITLE'
 ISSUE_URL_VARIABLE = 'SD1_COMMIT_ISSUE_URL'
 
+# overridable so the tests can point pr at a fake github server
+GITHUB_API = os.environ.get('SD1_GITHUB_API', 'https://api.github.com')
+BRANCH_PREFIX = 'eng/'
+PLACEHOLDER_MARKER = '(OOPS!)'
+
 GITHUB_REMOTE_PATTERN = re.compile(r'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$')
+REMOTE_USERNAME_PATTERN = re.compile(r'^https://([^@/:]+)(?::[^@/]*)?@github\.com/')
 ISSUE_URL_PATTERN = re.compile(r'github\.com/([^/]+)/([^/]+)/issues/(\d+)')
+
+
+class GitHubError(Exception):
+    pass
 
 
 def git_output(*arguments):
     result = subprocess.run(['git', *arguments], capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def git_succeeds(*arguments, quiet=True):
+    output = subprocess.DEVNULL if quiet else None
+    return subprocess.run(['git', *arguments], stdout=output, stderr=output).returncode == 0
 
 
 def fail(message):
@@ -78,13 +100,76 @@ def run_setup(options):
     hooks_directory.mkdir(parents=True, exist_ok=True)
     results = [install_hook(source, hooks_directory / source.name, options.force)
                for source in sorted(HOOKS_SOURCE.iterdir()) if source.is_file()]
+
+    existing_alias = git_output('config', '--local', 'alias.sd1')
+    if existing_alias not in (None, GIT_ALIAS) and not options.force:
+        print(f'skipped the `git sd1` alias: alias.sd1 is already set to "{existing_alias}". rerun with --force to replace it')
+        results.append(False)
+    else:
+        git_succeeds('config', '--local', 'alias.sd1', GIT_ALIAS)
+        print('installed the `git sd1` alias for this clone')
+
+    on_path = shutil.which('git-sd1')
+    if not on_path or Path(on_path).resolve() != Path(__file__).resolve():
+        # setup can't change the parent shell's PATH, so say exactly what to add
+        print('\nto run this as `git-sd1` from anywhere, add Tools/Scripts to your PATH, e.g. in ~/.zshrc or ~/.bashrc:')
+        print(f'    export PATH="{Path(__file__).resolve().parent}:$PATH"')
     return 0 if all(results) else 1
 
 
+def origin_url():
+    # the raw config value, not `git remote get-url`, which applies insteadOf
+    # rewrites and can turn a github url into something unrecognizable
+    return git_output('config', 'remote.origin.url') or ''
+
+
 def github_repository():
-    remote_url = git_output('remote', 'get-url', 'origin')
-    match = GITHUB_REMOTE_PATTERN.search(remote_url or '')
+    match = GITHUB_REMOTE_PATTERN.search(origin_url())
     return match.groups() if match else None
+
+
+def github_token():
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if token:
+        return token
+    # fall back to the token the credential helper already stores for pushing,
+    # so anyone who can push can open pull requests without extra setup
+    username_match = REMOTE_USERNAME_PATTERN.match(origin_url())
+    query = 'protocol=https\nhost=github.com\n'
+    if username_match:
+        query += f'username={username_match.group(1)}\n'
+    result = subprocess.run(['git', 'credential', 'fill'], input=query + '\n', capture_output=True, text=True,
+                            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    if result.returncode:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith('password='):
+            return line[len('password='):]
+    return None
+
+
+def github_request(method, path, token=None, payload=None):
+    request = urllib.request.Request(GITHUB_API + path, method=method,
+                                     data=json.dumps(payload).encode() if payload is not None else None,
+                                     headers={'Accept': 'application/vnd.github+json',
+                                              'Content-Type': 'application/json'})
+    if token:
+        request.add_header('Authorization', f'Bearer {token}')
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        # github explains validation failures (like "a pull request already
+        # exists") in the body, which is far more useful than the status line
+        try:
+            details = json.load(error)
+            reason = details.get('message', '')
+            reason += ''.join(f'; {item.get("message") or item}' for item in details.get('errors', []))
+        except ValueError:
+            reason = error.reason
+        raise GitHubError(f'{error.code} {reason}') from error
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise GitHubError(str(error)) from error
 
 
 def resolve_issue(issue_argument):
@@ -100,19 +185,11 @@ def resolve_issue(issue_argument):
 
 
 def fetch_issue_title(owner, repository, number):
-    request = urllib.request.Request(f'https://api.github.com/repos/{owner}/{repository}/issues/{number}',
-                                     headers={'Accept': 'application/vnd.github+json'})
-    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
-    if token:
-        request.add_header('Authorization', f'Bearer {token}')
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return json.load(response).get('title')
-    except (urllib.error.URLError, TimeoutError, ValueError) as error:
-        # the commit still goes ahead with the title placeholder; a private repo
-        # answers 404 unless GITHUB_TOKEN is set
-        print(f'git-sd1: couldn\'t fetch the title of issue #{number} ({error}). '
-              'fill it in yourself, or set GITHUB_TOKEN if the repository is private', file=sys.stderr)
+        return github_request('GET', f'/repos/{owner}/{repository}/issues/{number}', github_token()).get('title')
+    except GitHubError as error:
+        # the commit still goes ahead with the title placeholder
+        print(f'git-sd1: couldn\'t fetch the title of issue #{number} ({error}). fill it in yourself', file=sys.stderr)
         return None
 
 
@@ -122,8 +199,8 @@ def hook_is_installed():
     return bool(hook and hook.exists() and INSTALLED_MARKER in hook.read_text(encoding='utf-8', errors='replace'))
 
 
-def run_commit(options, git_arguments):
-    if options.update and options.issue:
+def commit(update, issue, git_arguments):
+    if update and issue:
         return fail('--issue only applies to new commits; edit the link into the message while amending')
     if not hook_is_installed():
         print('git-sd1: the commit hook isn\'t installed, so the message won\'t be formatted. '
@@ -134,12 +211,12 @@ def run_commit(options, git_arguments):
     environment = {name: value for name, value in os.environ.items()
                    if name not in (UPDATE_VARIABLE, TITLE_VARIABLE, ISSUE_URL_VARIABLE)}
     command = ['git', 'commit']
-    if options.update:
+    if update:
         command.append('--amend')
         environment[UPDATE_VARIABLE] = '1'
-    if options.issue:
+    if issue:
         try:
-            owner, repository, number = resolve_issue(options.issue)
+            owner, repository, number = resolve_issue(issue)
         except ValueError as error:
             return fail(str(error))
         environment[ISSUE_URL_VARIABLE] = f'https://github.com/{owner}/{repository}/issues/{number}'
@@ -149,7 +226,156 @@ def run_commit(options, git_arguments):
     return subprocess.run(command + git_arguments, env=environment).returncode
 
 
+def run_commit(options, git_arguments):
+    return commit(options.update, options.issue, git_arguments)
+
+
+def default_base_branch():
+    remote_head = git_output('symbolic-ref', '--short', '-q', 'refs/remotes/origin/HEAD')
+    return remote_head.split('/', 1)[1] if remote_head else 'main'
+
+
+def commits_ahead(upstream):
+    output = git_output('rev-list', '--reverse', f'{upstream}..HEAD')
+    return output.split() if output else []
+
+
+def commit_message(revision):
+    return git_output('log', '-1', '--format=%B', revision) or ''
+
+
+def split_title(message):
+    title, _, body = message.strip().partition('\n')
+    return title.strip(), body.strip()
+
+
+def branch_name_for(title):
+    slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')[:50].rstrip('-') or 'change'
+    name = BRANCH_PREFIX + slug
+    counter = 2
+    while git_succeeds('show-ref', '--verify', '--quiet', f'refs/heads/{name}'):
+        name = f'{BRANCH_PREFIX}{slug}-{counter}'
+        counter += 1
+    return name
+
+
+def unfinished_placeholders(messages):
+    # placeholders are whole lines ending in the marker, so a description that
+    # merely talks about "(OOPS!)" mid-sentence isn't flagged. the reviewer line is
+    # expected to stay a placeholder until someone approves the pull request
+    return [line for message in messages for line in message.splitlines()
+            if line.rstrip().rstrip('.').endswith(PLACEHOLDER_MARKER) and not line.startswith('Reviewed by')]
+
+
+def pull_request_text(messages):
+    # the commit message is the source of truth, so the description is rebuilt
+    # from it on every run instead of being edited on github
+    title, body = split_title(messages[0])
+    if len(messages) == 1:
+        return title, body
+    sections = []
+    for message in messages:
+        commit_title, commit_body = split_title(message)
+        sections.append(f'#### {commit_title}\n\n{commit_body}'.strip())
+    return title, '\n\n'.join(sections)
+
+
+def account_note(pull_request):
+    # the token can come from a credential helper or an editor's github login, so
+    # say which account it belongs to; a wrong account is obvious right away
+    login = (pull_request.get('user') or {}).get('login')
+    return f' as {login}' if login else ''
+
+
+def run_pr(options):
+    repository = github_repository()
+    if repository is None:
+        return fail('origin isn\'t a github remote')
+    owner, repository_name = repository
+    base = options.base or default_base_branch()
+    upstream = f'origin/{base}'
+    current_branch = git_output('symbolic-ref', '--short', '-q', 'HEAD')
+    if current_branch is None:
+        return fail('HEAD is detached; check out a branch first')
+    if not git_succeeds('fetch', '--quiet', 'origin', base, quiet=False):
+        return fail(f'couldn\'t fetch {upstream}')
+
+    has_staged_changes = not git_succeeds('diff', '--cached', '--quiet')
+    if has_staged_changes:
+        # staged work on a branch that already has its commit is
+        # folded into that commit instead of piling up review-fix commits
+        update = current_branch != base and bool(commits_ahead(upstream))
+        exit_code = commit(update, None if update else options.issue, [])
+        if exit_code:
+            return exit_code
+    elif not git_succeeds('diff', '--quiet'):
+        print('git-sd1: unstaged changes are not included; `git add` them and rerun to put them in the pull request',
+              file=sys.stderr)
+
+    ahead = commits_ahead(upstream)
+    if not ahead:
+        return fail(f'nothing to open a pull request for: no commits ahead of {upstream}')
+
+    if current_branch == base:
+        branch = options.branch or branch_name_for(split_title(commit_message(ahead[0]))[0])
+        if not git_succeeds('switch', '--quiet', '-c', branch, quiet=False):
+            return fail(f'couldn\'t create {branch}')
+        # the commits now live on the new branch, so the local base goes back to
+        # matching the remote and stays clean for the next piece of work
+        git_succeeds('branch', '--force', base, upstream)
+        print(f'git-sd1: moved your commits onto {branch}; {base} now matches {upstream}')
+        current_branch = branch
+
+    if not options.no_rebase and not git_succeeds('rebase', '--quiet', '--autostash', upstream, quiet=False):
+        return fail(f'rebasing onto {upstream} hit conflicts. resolve them, run `git rebase --continue`, '
+                    'then rerun `git-sd1 pr` (or `git rebase --abort` to back out)')
+
+    messages = [commit_message(revision) for revision in commits_ahead(upstream)]
+    placeholders = unfinished_placeholders(messages)
+    if placeholders and not options.draft:
+        listed = '\n'.join(f'    {line}' for line in placeholders)
+        return fail(f'these lines still need filling in (fix them with `git-sd1 commit --update`, '
+                    f'or pass --draft to open a draft anyway):\n{listed}')
+
+    # force because `git-sd1 commit --update` rewrites the commit; the lease still
+    # refuses if someone else pushed to this branch since the last fetch
+    if not git_succeeds('push', '--quiet', '--force-with-lease', '--set-upstream', 'origin', current_branch, quiet=False):
+        return fail(f'pushing {current_branch} failed')
+
+    token = github_token()
+    if token is None:
+        return fail(f'pushed {current_branch}, but found no github token to open the pull request with. '
+                    'set GITHUB_TOKEN or store one in your git credential helper')
+
+    title, body = pull_request_text(messages)
+    pulls_path = f'/repos/{owner}/{repository_name}/pulls'
+    try:
+        head_query = urllib.parse.urlencode({'head': f'{owner}:{current_branch}', 'state': 'open'})
+        existing = github_request('GET', f'{pulls_path}?{head_query}', token)
+        if existing:
+            pull_request = github_request('PATCH', f'{pulls_path}/{existing[0]["number"]}', token,
+                                          {'title': title, 'body': body})
+            print(f'updated pull request #{pull_request["number"]}{account_note(pull_request)}: {pull_request["html_url"]}')
+        else:
+            pull_request = github_request('POST', pulls_path, token, {'title': title, 'body': body, 'head': current_branch,
+                                                                      'base': base, 'draft': options.draft})
+            print(f'opened pull request #{pull_request["number"]}{account_note(pull_request)}: {pull_request["html_url"]}')
+    except GitHubError as error:
+        return fail(f'pushed {current_branch}, but github refused the pull request: {error}')
+
+    if options.open:
+        webbrowser.open(pull_request['html_url'])
+    return 0
+
+
 def main():
+    # when run through the `git sd1` alias, git has already moved to the top of the
+    # work tree and says where the command was typed in GIT_PREFIX. going back there
+    # keeps relative paths like `git sd1 commit detection/fusion.py` meaning what they say
+    typed_from = os.environ.pop('GIT_PREFIX', '')
+    if typed_from:
+        os.chdir(typed_from)
+
     parser = argparse.ArgumentParser(prog='git-sd1', description='repository helper for the 3d printing failure detector')
     subcommands = parser.add_subparsers(dest='command', required=True)
 
@@ -162,11 +388,25 @@ def main():
                                help='amend the last commit and refresh its file list, keeping what you wrote')
     commit_parser.add_argument('--issue', metavar='NUMBER_OR_URL', help='github issue to link under the title')
 
+    pr_parser = subcommands.add_parser(
+        'pr', help='commit staged changes, push the branch, and open or update its pull request',
+        description='staged changes become a new commit, or are folded into the branch\'s commit if it has one. '
+                    'run from the base branch, your commits move onto a new eng/ branch first. the pull request '
+                    'title and description come from the commit message and are rewritten on every run.')
+    pr_parser.add_argument('--issue', metavar='NUMBER_OR_URL', help='github issue to link if a new commit is made')
+    pr_parser.add_argument('--base', help='branch to merge into (default: origin\'s default branch)')
+    pr_parser.add_argument('--branch', help='name for the new branch when starting from the base branch')
+    pr_parser.add_argument('--draft', action='store_true', help='open as a draft, which also allows (OOPS!) placeholders')
+    pr_parser.add_argument('--no-rebase', action='store_true', help='push without rebasing onto the latest base first')
+    pr_parser.add_argument('--open', action='store_true', help='open the pull request in a browser afterwards')
+
     options, extra_arguments = parser.parse_known_args()
+    if options.command != 'commit' and extra_arguments:
+        parser.error(f'unrecognized arguments: {" ".join(extra_arguments)}')
     if options.command == 'setup':
-        if extra_arguments:
-            parser.error(f'unrecognized arguments: {" ".join(extra_arguments)}')
         return run_setup(options)
+    if options.command == 'pr':
+        return run_pr(options)
     return run_commit(options, extra_arguments)
 
 

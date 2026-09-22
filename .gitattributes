@@ -5,3 +5,6 @@
 *.cpp diff=cpp
 *.hpp diff=cpp
 *.ino diff=cpp
+# python scripts without a .py extension
+Tools/Scripts/git-sd1 diff=python
+Tools/Scripts/hooks/* diff=python

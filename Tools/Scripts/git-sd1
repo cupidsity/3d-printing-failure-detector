@@ -8,6 +8,8 @@
 #   git-sd1 commit --issue 24       also link issue 24 and use its title
 #   git-sd1 amend                   amend the last commit and refresh its file list
 #   git-sd1 pr                      commit anything staged, push, and open or update the pull request
+#   git-sd1 land 12                 rebase pull request 12 onto main and push it there without a merge commit
+#                                   (the merge-queue github workflow runs this when the label is added)
 #
 # arguments `commit` and `amend` don't recognize (-a, -v, paths, ...) go straight to git commit.
 
@@ -19,6 +21,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,6 +47,11 @@ ISSUE_URL_VARIABLE = 'SD1_COMMIT_ISSUE_URL'
 GITHUB_API = os.environ.get('SD1_GITHUB_API', 'https://api.github.com')
 BRANCH_PREFIX = 'eng/'
 PLACEHOLDER_MARKER = '(OOPS!)'
+REVIEWER_PLACEHOLDER = 'Reviewed by NOBODY (OOPS!).'
+MERGE_QUEUE_LABEL = 'merge-queue'
+# how long land waits for github to notice the pushed commits and mark the pull
+# request merged; overridable so the tests don't sit through it
+MERGED_POLL_SECONDS = float(os.environ.get('SD1_MERGED_POLL_SECONDS', '10'))
 
 GITHUB_REMOTE_PATTERN = re.compile(r'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$')
 REMOTE_USERNAME_PATTERN = re.compile(r'^https://([^@/:]+)(?::[^@/]*)?@github\.com/')
@@ -157,7 +166,9 @@ def github_request(method, path, token=None, payload=None):
         request.add_header('Authorization', f'Bearer {token}')
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            return json.load(response)
+            # deletes answer 204 with no body
+            body = response.read()
+            return json.loads(body) if body else None
     except urllib.error.HTTPError as error:
         # github explains validation failures (like "a pull request already
         # exists") in the body, which is far more useful than the status line
@@ -370,6 +381,181 @@ def run_pr(options):
     return 0
 
 
+class LandingRefused(Exception):
+    pass
+
+
+def reviewer_line(approver_names):
+    if not approver_names:
+        return 'Unreviewed.'
+    if len(approver_names) == 1:
+        return f'Reviewed by {approver_names[0]}.'
+    if len(approver_names) == 2:
+        return f'Reviewed by {approver_names[0]} and {approver_names[1]}.'
+    return f'Reviewed by {", ".join(approver_names[:-1])}, and {approver_names[-1]}.'
+
+
+def review_outcome(reviews, author_login):
+    # github keeps every review ever submitted; what counts is each reviewer's
+    # most recent approve / request-changes / dismissal. comments don't change it
+    latest_state = {}
+    for review in reviews:
+        login = (review.get('user') or {}).get('login')
+        if login and login != author_login and review['state'] in ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'):
+            latest_state[login] = review['state']
+    approvers = [login for login, state in latest_state.items() if state == 'APPROVED']
+    blockers = [login for login, state in latest_state.items() if state == 'CHANGES_REQUESTED']
+    return approvers, blockers
+
+
+def with_reviewer(message, line):
+    # only the untouched placeholder is replaced; a reviewer line someone wrote
+    # by hand is left exactly as they wrote it
+    lines = message.split('\n')
+    return '\n'.join(line if existing == REVIEWER_PLACEHOLDER else existing for existing in lines)
+
+
+def git_or_refuse(reason, *arguments):
+    result = subprocess.run(['git', *arguments], capture_output=True, text=True)
+    if result.returncode:
+        raise LandingRefused(f'{reason}\n\n```\n{(result.stderr or result.stdout).strip()}\n```')
+    return result.stdout.strip()
+
+
+def land_pull_request(number, token, owner, repository_name):
+    repository_path = f'/repos/{owner}/{repository_name}'
+    pull_request = github_request('GET', f'{repository_path}/pulls/{number}', token)
+    if pull_request['state'] != 'open':
+        raise LandingRefused('the pull request is not open.')
+    if pull_request.get('draft'):
+        raise LandingRefused('the pull request is still a draft.')
+    base = pull_request['base']['ref']
+    default_branch = github_request('GET', repository_path, token)['default_branch']
+    if base != default_branch:
+        raise LandingRefused(f'the merge queue only lands into {default_branch}, but this pull request targets {base}.')
+
+    reviews = github_request('GET', f'{repository_path}/pulls/{number}/reviews?per_page=100', token)
+    approvers, blockers = review_outcome(reviews, pull_request['user']['login'])
+    if blockers:
+        raise LandingRefused(f'changes were requested by {", ".join("@" + login for login in blockers)}. '
+                             'land it once they approve or their review is dismissed.')
+    approver_names = [github_request('GET', f'/users/{login}', token).get('name') or login for login in approvers]
+
+    # refs/pull/N/head exists for every pull request, including ones from forks
+    git_or_refuse(f'couldn\'t fetch {base} and the pull request.', 'fetch', '--quiet', 'origin',
+                  f'+refs/heads/{base}:refs/remotes/origin/{base}', f'+refs/pull/{number}/head:refs/sd1/landing')
+    upstream = f'origin/{base}'
+    git_or_refuse('couldn\'t check out the pull request.', 'checkout', '--quiet', '--detach', 'refs/sd1/landing')
+    # rebase rather than cherry-pick: it drops commits whose changes already
+    # landed, which happens when a branch is reused after an earlier landing
+    rebase = subprocess.run(['git', 'rebase', '--quiet', upstream], capture_output=True, text=True)
+    if rebase.returncode:
+        subprocess.run(['git', 'rebase', '--abort'], capture_output=True)
+        raise LandingRefused(f'the commits don\'t rebase cleanly onto the latest {base}. '
+                             f'run `git-sd1 pr` to rebase and resolve the conflicts, then add the label again.')
+
+    commits = commits_ahead(upstream)
+    if not commits:
+        raise LandingRefused(f'there is nothing to land; everything in this pull request is already in {base}.')
+    messages = [commit_message(revision) for revision in commits]
+    placeholders = unfinished_placeholders(messages)
+    if placeholders:
+        listed = '\n'.join(f'    {line}' for line in placeholders)
+        raise LandingRefused(f'these lines still need filling in (fix them with `git-sd1 amend` and `git-sd1 pr`):\n\n```\n{listed}\n```')
+
+    # replay the rebased commits with the reviewer line filled in. author and
+    # author date carry over; the committer is whoever runs the landing
+    line = reviewer_line(approver_names)
+    git_or_refuse('couldn\'t rewrite the commits.', 'checkout', '--quiet', '--detach', upstream)
+    for revision, message in zip(commits, messages):
+        git_or_refuse(f'couldn\'t replay {revision[:7]}.', 'cherry-pick', '--allow-empty', '--keep-redundant-commits', revision)
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8') as message_file:
+            message_file.write(with_reviewer(message, line))
+        try:
+            git_or_refuse(f'couldn\'t rewrite the message of {revision[:7]}.', 'commit', '--quiet', '--amend',
+                          '--no-verify', '--cleanup=verbatim', '--file', message_file.name)
+        finally:
+            os.unlink(message_file.name)
+    landed = git_output('rev-parse', 'HEAD')
+
+    head = pull_request['head']
+    same_repository = (head.get('repo') or {}).get('full_name') == f'{owner}/{repository_name}'
+    if same_repository:
+        # pushing the landed commits to the pull request branch first means the
+        # branch tip is exactly what lands, which is how github knows to show the
+        # pull request as merged instead of closed
+        git_or_refuse('couldn\'t update the pull request branch.', 'push', '--quiet', '--force', 'origin',
+                      f'{landed}:refs/heads/{head["ref"]}')
+    # not forced: if someone pushed to the base branch since the fetch, this
+    # fails and nothing is overwritten
+    git_or_refuse(f'couldn\'t push to {base}; it probably moved while landing. add the label again to retry.',
+                  'push', '--quiet', 'origin', f'{landed}:refs/heads/{base}')
+    return pull_request, landed, len(commits), line
+
+
+def run_land(options):
+    repository = github_repository()
+    if repository is None:
+        return fail('origin isn\'t a github remote')
+    owner, repository_name = repository
+    token = github_token()
+    if token is None:
+        return fail('found no github token; set GITHUB_TOKEN')
+    repository_path = f'/repos/{owner}/{repository_name}'
+    number = options.number
+
+    def finish(comment):
+        # the label is removed whether or not landing worked, so adding it again
+        # is always how to retry
+        github_request('POST', f'{repository_path}/issues/{number}/comments', token, {'body': comment})
+        try:
+            github_request('DELETE', f'{repository_path}/issues/{number}/labels/{MERGE_QUEUE_LABEL}', token)
+        except GitHubError:
+            pass
+
+    if not git_succeeds('diff', '--quiet', 'HEAD'):
+        return fail('commit or stash your changes first; landing checks out other commits')
+    # landing works on a detached HEAD, so remember where to come back to when
+    # it's run by hand instead of by the workflow
+    original_position = git_output('symbolic-ref', '--quiet', '--short', 'HEAD') or git_output('rev-parse', 'HEAD')
+    try:
+        pull_request, landed, commit_count, line = land_pull_request(number, token, owner, repository_name)
+    except LandingRefused as refusal:
+        finish(f'The merge queue couldn\'t land this: {refusal}')
+        return fail(f'refused to land #{number}: {refusal}')
+    except GitHubError as error:
+        finish(f'The merge queue couldn\'t land this: github returned an error ({error}).')
+        return fail(f'github error while landing #{number}: {error}')
+    finally:
+        if original_position:
+            git_succeeds('checkout', '--quiet', original_position)
+
+    base = pull_request['base']['ref']
+    commit_url = f'https://github.com/{owner}/{repository_name}/commit/{landed}'
+    noun = 'commit' if commit_count == 1 else f'{commit_count} commits'
+    finish(f'Landed {noun} on `{base}` as {commit_url} ({line.rstrip(".")}).')
+
+    deadline = time.monotonic() + MERGED_POLL_SECONDS
+    merged = False
+    while True:
+        merged = github_request('GET', f'{repository_path}/pulls/{number}', token).get('merged')
+        if merged or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    if not merged:
+        # forks, or github not catching up: close it by hand so nothing is left open
+        github_request('PATCH', f'{repository_path}/pulls/{number}', token, {'state': 'closed'})
+
+    head = pull_request['head']
+    if (head.get('repo') or {}).get('full_name') == f'{owner}/{repository_name}':
+        try:
+            github_request('DELETE', f'{repository_path}/git/refs/heads/{urllib.parse.quote(head["ref"])}', token)
+        except GitHubError:
+            pass
+    print(f'landed #{number} on {base} as {landed[:12]}')
+    return 0
+
+
 def main():
     # when run through the `git sd1` alias, git has already moved to the top of the
     # work tree and says where the command was typed in GIT_PREFIX. going back there
@@ -403,6 +589,13 @@ def main():
     pr_parser.add_argument('--no-rebase', action='store_true', help='push without rebasing onto the latest base first')
     pr_parser.add_argument('--open', action='store_true', help='open the pull request in a browser afterwards')
 
+    land_parser = subcommands.add_parser(
+        'land', help='rebase a pull request onto main and push it without a merge commit',
+        description='fills in the reviewer line from github approvals ("Unreviewed." if there are none), '
+                    'rebases the commits onto the latest base branch, pushes them, comments with the result, '
+                    'and removes the merge-queue label. the merge-queue workflow runs this.')
+    land_parser.add_argument('number', type=int, help='pull request number')
+
     options, extra_arguments = parser.parse_known_args()
     if options.command not in ('commit', 'amend') and extra_arguments:
         parser.error(f'unrecognized arguments: {" ".join(extra_arguments)}')
@@ -410,6 +603,8 @@ def main():
         return run_setup(options)
     if options.command == 'pr':
         return run_pr(options)
+    if options.command == 'land':
+        return run_land(options)
     if options.command == 'amend':
         return run_amend(extra_arguments)
     return run_commit(options, extra_arguments)

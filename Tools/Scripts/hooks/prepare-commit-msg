@@ -269,6 +269,9 @@ def component_prefix(changes):
     # titles start with the area they touch, like "[Detection]", taken from
     # the top-level folder when every changed file sits in the same one
     components = {change.path.split('/')[0] for change in changes if '/' in change.path}
+    # root files and dot-folders like .github are repository plumbing, so they only
+    # decide the tag when nothing else changed
+    components = {component for component in components if not component.startswith('.')} or components
     if len(components) != 1:
         return ''
     component = components.pop()

@@ -149,6 +149,12 @@ class NewMessageTest(unittest.TestCase):
         lines, _ = hook.build_new_message(changes, None, None, '#')
         self.assertEqual(lines[:3], [hook.TITLE_PLACEHOLDER, '', hook.REVIEWER_PLACEHOLDER])
 
+    def test_repository_plumbing_does_not_decide_the_tag(self):
+        changes = [hook.Change('A', '.github/workflows/merge-queue.yml'), hook.Change('M', 'README.md'),
+                   hook.Change('M', 'Tools/Scripts/git-sd1')]
+        self.assertEqual(hook.component_prefix(changes), '[Tools] ')
+        self.assertEqual(hook.component_prefix([hook.Change('A', '.github/workflows/ci.yml')]), '[.github] ')
+
     def test_issue_title_already_tagged_is_not_prefixed_again(self):
         lines, _ = hook.build_new_message([hook.Change('M', 'frontend/app.tsx')], '[Frontend] Show confidence', None, '#')
         self.assertEqual(lines[0], '[Frontend] Show confidence')

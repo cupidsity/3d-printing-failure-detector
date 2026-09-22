@@ -2,7 +2,7 @@
 # prepare-commit-msg hook that lays out the commit message format described in
 # the readme. git runs it right before opening the editor. `git-sd1 commit` sets
 # the environment variables read below; a plain `git commit` still gets the
-# template, just without the issue title or the --update behavior.
+# template, just without the issue title or the `git-sd1 amend` behavior.
 #
 # this is the source copy. `git-sd1 setup` installs it into .git/hooks, so rerun
 # that after editing this file.
@@ -488,7 +488,7 @@ def main(message_path, source='', commit_sha=''):
         amending = commit_sha == 'HEAD'
         if os.environ.get(UPDATE_VARIABLE) != '1' or not amending:
             if amending:
-                comments = [f'{comment_char} Run `git-sd1 commit --update` instead to refresh the file list.'] + comments
+                comments = [f'{comment_char} Run `git-sd1 amend` instead to refresh the file list.'] + comments
             lines, hints = strip_trailing_blanks(body), []
         else:
             base = diff_base(amending=True)

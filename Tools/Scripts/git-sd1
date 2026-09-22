@@ -6,10 +6,10 @@
 #   git-sd1 setup                   install the repository's git hooks (rerun after they change)
 #   git-sd1 commit                  new commit from the staged changes, formatted by the hook
 #   git-sd1 commit --issue 24       also link issue 24 and use its title
-#   git-sd1 commit --update         amend the last commit and refresh its file list
+#   git-sd1 amend                   amend the last commit and refresh its file list
 #   git-sd1 pr                      commit anything staged, push, and open or update the pull request
 #
-# arguments `commit` doesn't recognize (-a, -v, paths, ...) go straight to git commit.
+# arguments `commit` and `amend` don't recognize (-a, -v, paths, ...) go straight to git commit.
 
 import argparse
 import json
@@ -200,8 +200,6 @@ def hook_is_installed():
 
 
 def commit(update, issue, git_arguments):
-    if update and issue:
-        return fail('--issue only applies to new commits; edit the link into the message while amending')
     if not hook_is_installed():
         print('git-sd1: the commit hook isn\'t installed, so the message won\'t be formatted. '
               'run `git-sd1 setup` first', file=sys.stderr)
@@ -227,7 +225,11 @@ def commit(update, issue, git_arguments):
 
 
 def run_commit(options, git_arguments):
-    return commit(options.update, options.issue, git_arguments)
+    return commit(False, options.issue, git_arguments)
+
+
+def run_amend(git_arguments):
+    return commit(True, None, git_arguments)
 
 
 def default_base_branch():
@@ -334,10 +336,10 @@ def run_pr(options):
     placeholders = unfinished_placeholders(messages)
     if placeholders and not options.draft:
         listed = '\n'.join(f'    {line}' for line in placeholders)
-        return fail(f'these lines still need filling in (fix them with `git-sd1 commit --update`, '
+        return fail(f'these lines still need filling in (fix them with `git-sd1 amend`, '
                     f'or pass --draft to open a draft anyway):\n{listed}')
 
-    # force because `git-sd1 commit --update` rewrites the commit; the lease still
+    # force because `git-sd1 amend` rewrites the commit; the lease still
     # refuses if someone else pushed to this branch since the last fetch
     if not git_succeeds('push', '--quiet', '--force-with-lease', '--set-upstream', 'origin', current_branch, quiet=False):
         return fail(f'pushing {current_branch} failed')
@@ -384,9 +386,10 @@ def main():
 
     commit_parser = subcommands.add_parser('commit', help='commit with the structured message format',
                                            epilog='any other arguments are passed to git commit')
-    commit_parser.add_argument('--update', action='store_true',
-                               help='amend the last commit and refresh its file list, keeping what you wrote')
     commit_parser.add_argument('--issue', metavar='NUMBER_OR_URL', help='github issue to link under the title')
+
+    subcommands.add_parser('amend', help='amend the last commit and refresh its file list, keeping what you wrote',
+                           epilog='any other arguments are passed to git commit --amend')
 
     pr_parser = subcommands.add_parser(
         'pr', help='commit staged changes, push the branch, and open or update its pull request',
@@ -401,12 +404,14 @@ def main():
     pr_parser.add_argument('--open', action='store_true', help='open the pull request in a browser afterwards')
 
     options, extra_arguments = parser.parse_known_args()
-    if options.command != 'commit' and extra_arguments:
+    if options.command not in ('commit', 'amend') and extra_arguments:
         parser.error(f'unrecognized arguments: {" ".join(extra_arguments)}')
     if options.command == 'setup':
         return run_setup(options)
     if options.command == 'pr':
         return run_pr(options)
+    if options.command == 'amend':
+        return run_amend(extra_arguments)
     return run_commit(options, extra_arguments)
 
 

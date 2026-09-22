@@ -49,7 +49,7 @@ Setup installs the commit hook. Then put `Tools/Scripts` on your `PATH` (setup p
 ```
 git-sd1 commit              # new commit, file list filled in from what's staged
 git-sd1 commit --issue 24   # also link issue 24 and use its title
-git-sd1 commit --update     # amend after review: refreshes the file list, keeps what you wrote
+git-sd1 amend               # amend after review: refreshes the file list, keeps what you wrote
 ```
 
 Other arguments (`-a`, `-v`, ...) are passed through to `git commit`. Replace every line marked `(OOPS!)` before pushing.
@@ -62,7 +62,7 @@ git-sd1 pr --draft    # open as a draft, allowed to still contain (OOPS!) lines
 git-sd1 pr --open     # also open it in the browser
 ```
 
-`pr` commits anything staged first. On a branch that already has its commit, the staged changes are folded into it with `commit --update`, so review fixes don't pile up as extra commits. Run from `main`, your commits move onto a new `eng/<title>` branch and `main` is reset to match `origin/main`. The branch is rebased onto the latest `main` and force-pushed, and the pull request title and description are rebuilt from the commit message on every run. Edit the commit message, not the description on GitHub.
+`pr` commits anything staged first. On a branch that already has its commit, the staged changes are folded into it with `git-sd1 amend`, so review fixes don't pile up as extra commits. Run from `main`, your commits move onto a new `eng/<title>` branch and `main` is reset to match `origin/main`. The branch is rebased onto the latest `main` and force-pushed, and the pull request title and description are rebuilt from the commit message on every run. Edit the commit message, not the description on GitHub.
 
 `pr` needs a GitHub token that can create pull requests. It uses `GITHUB_TOKEN` (or `GH_TOKEN`) if set, and otherwise asks git for the token it already uses to push (your credential helper, or your editor's GitHub login). If you have more than one GitHub account, put your username in the remote (`https://<username>@github.com/...`) so the right token is picked. `pr` prints which account opened the pull request.
 

@@ -78,3 +78,4 @@ Run the tests with `python3 -m unittest discover Tools/Scripts/tests`.
 
 ## Team Members 
 1. Layla Le
+2. John Vezzola

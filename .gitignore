@@ -1,0 +1,38 @@
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# secrets and local config (moonraker keys, printer addresses, mqtt credentials)
+.env
+.env.*
+!.env.example
+*.local.*
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# node
+node_modules/
+dist/
+build/
+.cache/
+
+# print footage and captured frames can get huge, keep them out of git
+recordings/
+captures/
+*.mp4
+*.mkv
+*.avi
+*.h264
+
+# logs
+*.log
+logs/

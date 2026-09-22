@@ -80,3 +80,4 @@ Run the tests with `python3 -m unittest discover Tools/Scripts/tests`.
 1. Layla Le
 2. John Vezzola
 3. Diego Van Eggelpoel
+4. Nathan Spees

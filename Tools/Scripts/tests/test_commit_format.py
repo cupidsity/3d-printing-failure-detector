@@ -294,7 +294,7 @@ class EndToEndTest(unittest.TestCase):
         self.git('commit', '--amend', '--quiet', '-m', written)
         self.write('detection/thresholds.py', 'PAUSE_THRESHOLD = 0.8\n')
         self.git('add', '.')
-        self.run_sd1('commit', '--update', '--quiet')
+        self.run_sd1('amend', '--quiet')
 
         updated = self.last_message()
         self.assertIn('(fuse_confidence): Average instead of max.', updated)

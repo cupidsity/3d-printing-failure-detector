@@ -67,3 +67,6 @@ git-sd1 pr --open     # also open it in the browser
 `pr` needs a GitHub token that can create pull requests. It uses `GITHUB_TOKEN` (or `GH_TOKEN`) if set, and otherwise asks git for the token it already uses to push (your credential helper, or your editor's GitHub login). If you have more than one GitHub account, put your username in the remote (`https://<username>@github.com/...`) so the right token is picked. `pr` prints which account opened the pull request.
 
 Run the tests with `python3 -m unittest discover Tools/Scripts/tests`.
+
+## Team Members 
+Layla Le

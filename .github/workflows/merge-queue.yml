@@ -1,0 +1,39 @@
+# adding the merge-queue label to a pull request lands its commits on main with
+# `git-sd1 land`: rebased, reviewer line filled in from approvals, and no merge
+# commit. the label is removed afterwards either way, so re-adding it retries.
+name: merge-queue
+
+on:
+  # pull_request_target runs the workflow and scripts from main, never from the
+  # pull request, so a pull request can't change how it gets landed
+  pull_request_target:
+    types: [labeled]
+
+# one landing at a time; a second labeled pull request waits instead of racing
+concurrency:
+  group: merge-queue
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  land:
+    if: github.event.label.name == 'merge-queue'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Land the pull request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # rebasing needs a committer; the original authors are kept on every commit
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 Tools/Scripts/git-sd1 land ${{ github.event.pull_request.number }}

@@ -66,6 +66,14 @@ git-sd1 pr --open     # also open it in the browser
 
 `pr` needs a GitHub token that can create pull requests. It uses `GITHUB_TOKEN` (or `GH_TOKEN`) if set, and otherwise asks git for the token it already uses to push (your credential helper, or your editor's GitHub login). If you have more than one GitHub account, put your username in the remote (`https://<username>@github.com/...`) so the right token is picked. `pr` prints which account opened the pull request.
 
+### Landing
+
+Add the `merge-queue` label to a pull request to land it. A GitHub Action rebases its commits onto the latest `main` and pushes them there as they are, with no `Merge pull request #N` commit. Before pushing, it fills in `Reviewed by NOBODY (OOPS!).` from the pull request's approvals (`Reviewed by Caleb Feng.`), or `Unreviewed.` if nobody approved. A reviewer line you wrote yourself is left alone.
+
+The queue refuses to land, and says why in a comment, if a reviewer requested changes, a line other than the reviewer line is still `(OOPS!)`, or the commits conflict with `main`. The label is removed either way, so adding it again retries. Landings run one at a time. Please land with the label instead of GitHub's merge button.
+
+`git-sd1 land <number>` does the same thing from your own machine.
+
 Run the tests with `python3 -m unittest discover Tools/Scripts/tests`.
 
 ## Team Members 

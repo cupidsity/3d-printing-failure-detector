@@ -12,6 +12,9 @@
 #                                   (the merge-queue github workflow runs this when the label is added)
 #
 # arguments `commit` and `amend` don't recognize (-a, -v, paths, ...) go straight to git commit.
+#
+# on windows the `git-sd1` that powershell and cmd find is git-sd1.cmd next to this
+# file; it locates python and runs this script. keep the two together.
 
 import argparse
 import json
@@ -35,8 +38,15 @@ HOOKS_SOURCE = Path(__file__).resolve().parent / 'hooks'
 # overwrite one a developer added by hand
 INSTALLED_MARKER = '# installed by git-sd1 setup'
 # git runs "!" aliases from the top of the work tree, so a relative path to the
-# script works from any subdirectory and always runs this clone's own copy
+# script works from any subdirectory and always runs this clone's own copy.
+# windows goes through the .cmd shim, since the extensionless script isn't
+# runnable there on its own
+WINDOWS = os.name == 'nt'
 GIT_ALIAS = '!Tools/Scripts/git-sd1'
+WINDOWS_GIT_ALIAS = '!Tools/Scripts/git-sd1.cmd'
+# where a permanent PATH usually lives, to tell someone running git-sd1 the long
+# way that their shell will forget the directory again
+SHELL_PROFILES = ('.zshrc', '.zprofile', '.bashrc', '.bash_profile', '.profile')
 
 # names shared with hooks/prepare-commit-msg, which reads them
 UPDATE_VARIABLE = 'SD1_COMMIT_UPDATE'
@@ -102,6 +112,86 @@ def install_hook(source, destination, force):
     return True
 
 
+def already_on_path():
+    found = shutil.which('git-sd1')
+    # windows finds the .cmd shim rather than the script itself, so what matters
+    # is that the directory is this one and not another clone's
+    return bool(found) and Path(found).resolve().parent == Path(__file__).resolve().parent
+
+
+def shell_profile_description():
+    if WINDOWS:
+        return 'your account\'s Path'
+    shell = Path(os.environ.get('SHELL', '')).name
+    return f'~/.{shell}rc' if shell in ('zsh', 'bash') else 'your shell profile'
+
+
+def path_spellings(directory, home):
+    # profiles usually write a directory under the home directory as $HOME or ~,
+    # so the expanded path on its own misses the line that is already there
+    directory = Path(directory)
+    try:
+        tail = directory.relative_to(home).as_posix()
+    except ValueError:
+        return [str(directory)]
+    return [str(directory), f'$HOME/{tail}', f'${{HOME}}/{tail}', f'~/{tail}']
+
+
+def path_is_permanent(directory, home=None):
+    # whether a terminal opened tomorrow would still find git-sd1. a setting the
+    # developer keeps somewhere unusual reads as "no", which is why the warning
+    # this feeds can be turned off
+    if WINDOWS:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment') as environment:
+                stored = winreg.QueryValueEx(environment, 'Path')[0]
+        except (ImportError, OSError):
+            return True
+        return str(directory).lower() in stored.lower()
+    try:
+        home = home or Path.home()
+    except RuntimeError:
+        return True
+    spellings = path_spellings(directory, home)
+    return any(any(spelling in (home / name).read_text(encoding='utf-8', errors='replace')
+                   for spelling in spellings)
+               for name in SHELL_PROFILES if (home / name).is_file())
+
+
+def warn_about_path():
+    if git_output('config', '--get', 'sd1.pathcheck') == 'false':
+        return
+    directory = Path(__file__).resolve().parent
+    name = HOOKS_SOURCE.parent.relative_to(REPOSITORY_ROOT).as_posix()
+    found = shutil.which('git-sd1')
+    if found and Path(found).resolve().parent != directory:
+        problem = f'the `git-sd1` on your PATH is {found}, not this clone\'s copy'
+    elif not found:
+        problem = f'{name} isn\'t on your PATH, so git-sd1 only runs when you spell out the path to it'
+    elif not path_is_permanent(directory):
+        problem = (f'your PATH has {name} in this terminal, but {shell_profile_description()} doesn\'t '
+                   'set it, so the next terminal won\'t')
+    else:
+        return
+    print(f'git-sd1: {problem}. fix it with:', file=sys.stderr)
+    for line in path_instructions(directory):
+        print(f'    {line}', file=sys.stderr)
+    print('git-sd1: turn this check off with `git config sd1.pathcheck false`', file=sys.stderr)
+
+
+def path_instructions(directory, windows=WINDOWS):
+    # setup can't change the parent shell's PATH, so say exactly what to run
+    if windows:
+        directory = str(directory)
+        return ['powershell, for this window:',
+                f'    $env:Path = "{directory};$env:Path"',
+                'powershell, for every new one (reopen the terminal afterwards):',
+                f'    [Environment]::SetEnvironmentVariable(\'Path\', "{directory};" + '
+                '[Environment]::GetEnvironmentVariable(\'Path\', \'User\'), \'User\')']
+    return ['in ~/.zshrc or ~/.bashrc:', f'    export PATH="{directory}:$PATH"']
+
+
 def run_setup(options):
     hooks_directory = installed_hooks_directory()
     if hooks_directory is None:
@@ -110,19 +200,19 @@ def run_setup(options):
     results = [install_hook(source, hooks_directory / source.name, options.force)
                for source in sorted(HOOKS_SOURCE.iterdir()) if source.is_file()]
 
+    alias = WINDOWS_GIT_ALIAS if WINDOWS else GIT_ALIAS
     existing_alias = git_output('config', '--local', 'alias.sd1')
-    if existing_alias not in (None, GIT_ALIAS) and not options.force:
+    if existing_alias not in (None, GIT_ALIAS, WINDOWS_GIT_ALIAS) and not options.force:
         print(f'skipped the `git sd1` alias: alias.sd1 is already set to "{existing_alias}". rerun with --force to replace it')
         results.append(False)
     else:
-        git_succeeds('config', '--local', 'alias.sd1', GIT_ALIAS)
+        git_succeeds('config', '--local', 'alias.sd1', alias)
         print('installed the `git sd1` alias for this clone')
 
-    on_path = shutil.which('git-sd1')
-    if not on_path or Path(on_path).resolve() != Path(__file__).resolve():
-        # setup can't change the parent shell's PATH, so say exactly what to add
-        print('\nto run this as `git-sd1` from anywhere, add Tools/Scripts to your PATH, e.g. in ~/.zshrc or ~/.bashrc:')
-        print(f'    export PATH="{Path(__file__).resolve().parent}:$PATH"')
+    if not already_on_path():
+        print('\nto run it as `git-sd1` from anywhere, put Tools/Scripts on your PATH:')
+        for line in path_instructions(Path(__file__).resolve().parent):
+            print(f'    {line}')
     return 0 if all(results) else 1
 
 
@@ -332,7 +422,7 @@ def finished_pull_requests(owner, repository_name, branch, token):
     return [pull_request for pull_request in pull_requests if pull_request.get('state') == 'closed']
 
 
-def move_to_branch(branch, replacement, branch_is_ours):
+def move_to_branch(replacement, branch_is_ours):
     # a branch this run created is renamed, since nothing else points at it. one
     # the developer made is left where it is and the commits are branched off it
     if branch_is_ours:
@@ -383,10 +473,25 @@ def confirm_branch_is_new(owner, repository_name, branch, token, branch_is_ours,
         replacement = ask_for_replacement_branch()
         if replacement is None:
             return branch, f'{branch} already had pull request {listed}'
-        if not move_to_branch(branch, replacement, branch_is_ours):
+        if not move_to_branch(replacement, branch_is_ours):
             return branch, f'couldn\'t move your commits onto {replacement}'
         print(f'git-sd1: using {replacement}')
         branch = replacement
+
+
+def refresh_remote_branch(branch):
+    # the push leases on refs/remotes/origin/<branch>, so that ref has to be
+    # current. landing deletes the branch on github, and the tracking ref left
+    # over from before makes the next push look like it would clobber someone's
+    # work, which git rejects as "stale info"
+    listing = git_output('ls-remote', '--heads', 'origin', f'refs/heads/{branch}')
+    if listing is None:
+        # the remote is unreachable; leave the lease alone and let the push say so
+        return
+    if listing:
+        git_succeeds('fetch', '--quiet', 'origin', f'+refs/heads/{branch}:refs/remotes/origin/{branch}')
+    else:
+        git_succeeds('update-ref', '-d', f'refs/remotes/origin/{branch}')
 
 
 def undo_branch(branch, base, base_position):
@@ -466,8 +571,10 @@ def run_pr(options):
 
     # force because `git-sd1 amend` rewrites the commit; the lease still
     # refuses if someone else pushed to this branch since the last fetch
+    refresh_remote_branch(current_branch)
     if not git_succeeds('push', '--quiet', '--force-with-lease', '--set-upstream', 'origin', current_branch, quiet=False):
-        return fail(f'pushing {current_branch} failed')
+        return fail(f'pushing {current_branch} failed. if git called it "stale info", someone else pushed to '
+                    f'{current_branch}; look at their commits, then rerun')
 
     if token is None:
         return fail(f'pushed {current_branch}, but found no github token to open the pull request with. '
@@ -723,6 +830,10 @@ def main():
         parser.error(f'unrecognized arguments: {" ".join(extra_arguments)}')
     if options.command == 'setup':
         return run_setup(options)
+    # setup prints the same thing on its own, and land runs in the merge-queue
+    # workflow where nobody is reading
+    if options.command != 'land':
+        warn_about_path()
     if options.command == 'pr':
         return run_pr(options)
     if options.command == 'land':

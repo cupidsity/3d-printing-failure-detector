@@ -41,10 +41,17 @@ Test: detection/tests/test_fusion.py
 `git-sd1` fills most of this in for you. Run this once after cloning, and again whenever anything in `Tools/Scripts/hooks` changes:
 
 ```
-Tools/Scripts/git-sd1 setup
+Tools/Scripts/git-sd1 setup           # macos, linux, git bash
+python Tools\Scripts\git-sd1 setup    # powershell, until Tools\Scripts is on your PATH
 ```
 
-Setup installs the commit hook. Then put `Tools/Scripts` on your `PATH` (setup prints the exact line for your `~/.zshrc` or `~/.bashrc`) so `git-sd1` works from anywhere. Stage your changes and commit with:
+Setup installs the commit hook. Then put `Tools/Scripts` on your `PATH` so `git-sd1` works from anywhere — setup prints the exact command, an `export` line for `~/.zshrc` or `~/.bashrc`, and the `$env:Path` and `SetEnvironmentVariable` commands for PowerShell. On Windows the name you type resolves to `Tools\Scripts\git-sd1.cmd`, which finds Python and runs the script, so `git-sd1 commit` works the same as everywhere else. Reopen the terminal after setting `PATH` permanently.
+
+Every command checks this and says what to run if `Tools/Scripts` is missing from your `PATH`, if the `git-sd1` your `PATH` finds belongs to a different clone, or if this terminal has it but your shell profile doesn't, so it disappears when you open a new one. The command still runs; it's a reminder, not a refusal. If you set your `PATH` somewhere the check can't see, turn it off with `git config sd1.pathcheck false`.
+
+Wherever `PATH` isn't set up, `git sd1 commit` works as a fallback in any clone that has run setup.
+
+Stage your changes and commit with:
 
 ```
 git-sd1 commit              # new commit, file list filled in from what's staged

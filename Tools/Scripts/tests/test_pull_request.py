@@ -291,6 +291,24 @@ class PullRequestEndToEndTest(unittest.TestCase):
         self.assertNotEqual(self.git('branch', '--list', 'eng/detection-add-fusion'), '')
         self.assertEqual(FakeGitHub.requests[-1][2]['head'], 'eng/fusion-average')
 
+    def test_pushing_a_branch_the_merge_queue_deleted(self):
+        # landing deletes the branch on github, which leaves origin/<branch>
+        # behind locally. --force-with-lease reads that stale ref as someone
+        # else's work and refuses the push with "stale info"
+        self.git('switch', '--quiet', '-c', 'eng/detection-add-fusion')
+        self.landed_branch_with_new_work()
+        self.git('push', '--quiet', '--set-upstream', 'origin', 'eng/detection-add-fusion')
+        subprocess.run(['git', '--git-dir', str(self.remote), 'branch', '--delete', '--force',
+                        'eng/detection-add-fusion'], check=True, capture_output=True, env=self.environment)
+        self.assertNotEqual(self.git('rev-parse', 'origin/eng/detection-add-fusion'), '')
+
+        (self.repository / 'fusion.py').write_text('def fuse(scores):\n    return sum(scores) / len(scores)\n')
+        self.git('add', '.')
+        result = self.run_sd1('pr', '--reuse-branch')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git('--git-dir', str(self.remote), 'rev-parse', 'eng/detection-add-fusion'),
+                         self.git('rev-parse', 'HEAD'))
+
     def test_open_pull_request_is_updated_without_asking(self):
         FakeGitHub.pull_requests = [{'number': 4, 'state': 'open', 'head': 'eng/detection-add-fusion',
                                      'html_url': 'https://github.com/team/detector/pull/4'}]

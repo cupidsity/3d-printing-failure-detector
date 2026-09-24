@@ -8,3 +8,5 @@
 # python scripts without a .py extension
 Tools/Scripts/git-sd1 diff=python
 Tools/Scripts/hooks/* diff=python
+# cmd.exe needs crlf, whatever the checkout it comes from
+*.cmd text eol=crlf

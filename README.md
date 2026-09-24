@@ -103,3 +103,4 @@ Run the tests with `python3 -m unittest discover Tools/Scripts/tests`.
 3. Diego Van Eggelpoel
 4. Nathan Spees
 5. Caleb Feng
+6. Nikki Stillings

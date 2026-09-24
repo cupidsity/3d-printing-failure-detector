@@ -262,11 +262,18 @@ def split_title(message):
     return title.strip(), body.strip()
 
 
+def branch_exists(name):
+    # the remote counts too: a name that is only on origin is still someone's
+    # branch, and reusing it would push onto their work
+    return (git_succeeds('show-ref', '--verify', '--quiet', f'refs/heads/{name}')
+            or git_succeeds('show-ref', '--verify', '--quiet', f'refs/remotes/origin/{name}'))
+
+
 def branch_name_for(title):
     slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')[:50].rstrip('-') or 'change'
     name = BRANCH_PREFIX + slug
     counter = 2
-    while git_succeeds('show-ref', '--verify', '--quiet', f'refs/heads/{name}'):
+    while branch_exists(name):
         name = f'{BRANCH_PREFIX}{slug}-{counter}'
         counter += 1
     return name
@@ -300,6 +307,96 @@ def account_note(pull_request):
     return f' as {login}' if login else ''
 
 
+def ask(question):
+    # stdin can be closed, which is what happens in a script or a ci job. that
+    # reads as no answer rather than as a yes
+    try:
+        return input(question).strip()
+    except EOFError:
+        return None
+
+
+def describe_pull_request(pull_request):
+    if pull_request.get('merged_at'):
+        return f'#{pull_request["number"]} (merged {pull_request["merged_at"][:10]})'
+    return f'#{pull_request["number"]} (closed without merging)'
+
+
+def finished_pull_requests(owner, repository_name, branch, token):
+    query = urllib.parse.urlencode({'head': f'{owner}:{branch}', 'state': 'all'})
+    pull_requests = github_request('GET', f'/repos/{owner}/{repository_name}/pulls?{query}', token)
+    # an open pull request for this branch means this run only updates it, which
+    # is the normal review loop and not a reused branch
+    if any(pull_request.get('state') != 'closed' for pull_request in pull_requests):
+        return []
+    return [pull_request for pull_request in pull_requests if pull_request.get('state') == 'closed']
+
+
+def move_to_branch(branch, replacement, branch_is_ours):
+    # a branch this run created is renamed, since nothing else points at it. one
+    # the developer made is left where it is and the commits are branched off it
+    if branch_is_ours:
+        return git_succeeds('branch', '--move', replacement)
+    return git_succeeds('switch', '--quiet', '-c', replacement, quiet=False)
+
+
+def ask_for_replacement_branch():
+    while True:
+        replacement = ask('name for the branch to use instead (blank to stop): ')
+        if not replacement:
+            return None
+        if '/' not in replacement:
+            replacement = BRANCH_PREFIX + replacement
+        if not git_succeeds('check-ref-format', '--branch', replacement):
+            print(f'git-sd1: "{replacement}" isn\'t a valid branch name')
+        elif branch_exists(replacement):
+            print(f'git-sd1: {replacement} already exists')
+        else:
+            return replacement
+
+
+def confirm_branch_is_new(owner, repository_name, branch, token, branch_is_ours, reuse_allowed):
+    # every pull request is supposed to start from its own branch. a branch whose
+    # pull request already closed has usually been landed and reused by accident,
+    # and pushing onto it again buries the new commits under a finished review
+    while True:
+        try:
+            closed = finished_pull_requests(owner, repository_name, branch, token)
+        except GitHubError as error:
+            # the check is a safeguard, not the job: say it didn't run and carry on
+            print(f'git-sd1: couldn\'t check whether {branch} was used before ({error})', file=sys.stderr)
+            return branch, None
+        if not closed:
+            return branch, None
+        listed = ' and '.join(describe_pull_request(pull_request) for pull_request in closed)
+        if reuse_allowed:
+            print(f'git-sd1: reusing {branch}, which already had pull request {listed}')
+            return branch, None
+        print(f'git-sd1: {branch} already had pull request {listed}, so this would be a second '
+              f'pull request from the same branch name.')
+        answer = ask(f'open another pull request from {branch} anyway? [y/N] ')
+        if answer is None:
+            return branch, (f'{branch} already had pull request {listed}, and there is no terminal to ask on. '
+                            'rerun with --branch NAME for a different branch, or --reuse-branch to use this one anyway')
+        if answer.lower() in ('y', 'yes'):
+            return branch, None
+        replacement = ask_for_replacement_branch()
+        if replacement is None:
+            return branch, f'{branch} already had pull request {listed}'
+        if not move_to_branch(branch, replacement, branch_is_ours):
+            return branch, f'couldn\'t move your commits onto {replacement}'
+        print(f'git-sd1: using {replacement}')
+        branch = replacement
+
+
+def undo_branch(branch, base, base_position):
+    # nothing has been pushed yet, so putting the base back where it was leaves
+    # the commits exactly where they were before this run
+    git_succeeds('branch', '--force', base, base_position)
+    git_succeeds('switch', '--quiet', base, quiet=False)
+    git_succeeds('branch', '--delete', '--force', branch)
+
+
 def run_pr(options):
     repository = github_repository()
     if repository is None:
@@ -329,7 +426,10 @@ def run_pr(options):
     if not ahead:
         return fail(f'nothing to open a pull request for: no commits ahead of {upstream}')
 
-    if current_branch == base:
+    branch_is_ours = current_branch == base
+    base_before_branching = None
+    if branch_is_ours:
+        base_before_branching = git_output('rev-parse', base)
         branch = options.branch or branch_name_for(split_title(commit_message(ahead[0]))[0])
         if not git_succeeds('switch', '--quiet', '-c', branch, quiet=False):
             return fail(f'couldn\'t create {branch}')
@@ -350,12 +450,25 @@ def run_pr(options):
         return fail(f'these lines still need filling in (fix them with `git-sd1 amend`, '
                     f'or pass --draft to open a draft anyway):\n{listed}')
 
+    # the last thing before the push, so refusing the branch leaves the remote
+    # untouched and the commits exactly where this run found them
+    token = github_token()
+    if token is not None:
+        current_branch, refusal = confirm_branch_is_new(owner, repository_name, current_branch, token,
+                                                        branch_is_ours, options.reuse_branch)
+        if refusal:
+            if branch_is_ours:
+                undo_branch(current_branch, base, base_before_branching)
+                return fail(f'{refusal}. your commits are back on {base} and nothing was pushed; '
+                            'rerun with `--branch NAME` to put them on a different branch')
+            return fail(f'{refusal}. nothing was pushed; move your commits onto a new branch '
+                        '(`git switch -c eng/NAME`) and rerun')
+
     # force because `git-sd1 amend` rewrites the commit; the lease still
     # refuses if someone else pushed to this branch since the last fetch
     if not git_succeeds('push', '--quiet', '--force-with-lease', '--set-upstream', 'origin', current_branch, quiet=False):
         return fail(f'pushing {current_branch} failed')
 
-    token = github_token()
     if token is None:
         return fail(f'pushed {current_branch}, but found no github token to open the pull request with. '
                     'set GITHUB_TOKEN or store one in your git credential helper')
@@ -586,11 +699,14 @@ def main():
     pr_parser = subcommands.add_parser(
         'pr', help='commit staged changes, push the branch, and open or update its pull request',
         description='staged changes become a new commit, or are folded into the branch\'s commit if it has one. '
-                    'run from the base branch, your commits move onto a new eng/ branch first. the pull request '
-                    'title and description come from the commit message and are rewritten on every run.')
+                    'run from the base branch, your commits move onto a new eng/ branch first. a branch whose '
+                    'earlier pull request is already closed asks before opening a second one from the same name. '
+                    'the pull request title and description come from the commit message and are rewritten on every run.')
     pr_parser.add_argument('--issue', metavar='NUMBER_OR_URL', help='github issue to link if a new commit is made')
     pr_parser.add_argument('--base', help='branch to merge into (default: origin\'s default branch)')
     pr_parser.add_argument('--branch', help='name for the new branch when starting from the base branch')
+    pr_parser.add_argument('--reuse-branch', action='store_true',
+                           help='open a pull request from a branch name whose earlier pull request is closed, without asking')
     pr_parser.add_argument('--draft', action='store_true', help='open as a draft, which also allows (OOPS!) placeholders')
     pr_parser.add_argument('--no-rebase', action='store_true', help='push without rebasing onto the latest base first')
     pr_parser.add_argument('--open', action='store_true', help='open the pull request in a browser afterwards')

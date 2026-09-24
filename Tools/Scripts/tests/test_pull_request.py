@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -67,7 +68,14 @@ class FakeGitHub(BaseHTTPRequestHandler):
 
     def do_GET(self):
         FakeGitHub.requests.append(('GET', self.path, None, self.headers.get('Authorization')))
-        self.respond(FakeGitHub.pull_requests)
+        # github filters the list by head branch and state, and git-sd1 relies on
+        # that: everything for a branch, or only the open ones
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        state = query.get('state', ['open'])[0]
+        head = query.get('head', [None])[0]
+        self.respond([pull_request for pull_request in FakeGitHub.pull_requests
+                      if state in ('all', pull_request.get('state', 'open'))
+                      and (head is None or head.partition(':')[2] == pull_request.get('head'))])
 
     def do_POST(self):
         payload = self.read_payload()
@@ -137,9 +145,12 @@ class PullRequestEndToEndTest(unittest.TestCase):
         return subprocess.run(['git', *arguments], cwd=self.repository, env=self.environment,
                               check=True, capture_output=True, text=True).stdout.strip()
 
-    def run_sd1(self, *arguments, environment=None):
+    def run_sd1(self, *arguments, environment=None, answers=None):
+        # without answers stdin is closed, so a prompt reads as no answer instead
+        # of blocking the test run on a terminal
+        streams = {'input': answers} if answers is not None else {'stdin': subprocess.DEVNULL}
         return subprocess.run([sys.executable, str(GIT_SD1), *arguments], cwd=self.repository,
-                              env=environment or self.environment, capture_output=True, text=True)
+                              env=environment or self.environment, capture_output=True, text=True, **streams)
 
     def commit_with_message(self, message):
         self.git('commit', '--quiet', '-m', message)
@@ -212,6 +223,86 @@ class PullRequestEndToEndTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.repository / 'theirs.py').exists())
         self.assertEqual(self.git('rev-list', '--count', 'origin/main..HEAD'), '1')
+
+    def landed_branch_with_new_work(self):
+        # the branch name a fresh commit would pick already belongs to a merged
+        # pull request, which is what happens after the merge queue lands one
+        FakeGitHub.pull_requests = [{'number': 4, 'state': 'closed', 'head': 'eng/detection-add-fusion',
+                                     'merged_at': '2026-09-20T10:00:00Z',
+                                     'html_url': 'https://github.com/team/detector/pull/4'}]
+        (self.repository / 'fusion.py').write_text('def fuse(scores):\n    return max(scores)\n')
+        self.git('add', '.')
+        self.commit_with_message('Detection: add fusion\n\nReviewed by NOBODY (OOPS!).\n\nFuses scores.\n\n* fusion.py: Added.')
+
+    def test_reused_branch_name_is_refused_without_an_answer(self):
+        self.landed_branch_with_new_work()
+        result = self.run_sd1('pr')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('already had pull request #4 (merged 2026-09-20)', result.stderr)
+        # the commits are back where they started and nothing reached the remote
+        self.assertEqual(self.git('branch', '--show-current'), 'main')
+        self.assertEqual(self.git('rev-list', '--count', 'origin/main..main'), '1')
+        self.assertEqual(self.git('branch', '--list', 'eng/detection-add-fusion'), '')
+        on_remote = subprocess.run(['git', '--git-dir', str(self.remote), 'rev-parse', '--verify', '--quiet',
+                                    'refs/heads/eng/detection-add-fusion'], capture_output=True, env=self.environment)
+        self.assertNotEqual(on_remote.returncode, 0)
+        self.assertTrue(all(method == 'GET' for method, _, _, _ in FakeGitHub.requests))
+
+    def test_reused_branch_name_can_be_confirmed(self):
+        self.landed_branch_with_new_work()
+        result = self.run_sd1('pr', answers='y\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git('branch', '--show-current'), 'eng/detection-add-fusion')
+        self.assertEqual(FakeGitHub.requests[-1][:2], ('POST', '/repos/team/detector/pulls'))
+
+    def test_reuse_branch_flag_skips_the_question(self):
+        self.landed_branch_with_new_work()
+        result = self.run_sd1('pr', '--reuse-branch')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(FakeGitHub.requests[-1][:2], ('POST', '/repos/team/detector/pulls'))
+
+    def test_declining_moves_the_commits_to_the_branch_the_user_names(self):
+        self.landed_branch_with_new_work()
+        result = self.run_sd1('pr', answers='n\nfusion-average\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # eng/ is added for them, and the pull request opens from the new name
+        self.assertEqual(self.git('branch', '--show-current'), 'eng/fusion-average')
+        self.assertEqual(self.git('branch', '--list', 'eng/detection-add-fusion'), '')
+        self.assertEqual(FakeGitHub.requests[-1][2]['head'], 'eng/fusion-average')
+
+    def test_declining_on_a_branch_that_already_landed_keeps_the_commits_there(self):
+        # kept working on the branch whose pull request was landed, instead of
+        # starting a new one, and then declined to reuse it
+        self.git('switch', '--quiet', '-c', 'eng/detection-add-fusion')
+        self.landed_branch_with_new_work()
+        result = self.run_sd1('pr', answers='n\n\n')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('git switch -c eng/NAME', result.stderr)
+        self.assertEqual(self.git('branch', '--show-current'), 'eng/detection-add-fusion')
+        self.assertEqual(self.git('rev-list', '--count', 'origin/main..HEAD'), '1')
+
+    def test_declining_on_a_branch_that_landed_can_branch_off_it(self):
+        self.git('switch', '--quiet', '-c', 'eng/detection-add-fusion')
+        self.landed_branch_with_new_work()
+        result = self.run_sd1('pr', answers='n\nfusion-average\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # their own branch is left alone, the commits go onto the new one
+        self.assertEqual(self.git('branch', '--show-current'), 'eng/fusion-average')
+        self.assertNotEqual(self.git('branch', '--list', 'eng/detection-add-fusion'), '')
+        self.assertEqual(FakeGitHub.requests[-1][2]['head'], 'eng/fusion-average')
+
+    def test_open_pull_request_is_updated_without_asking(self):
+        FakeGitHub.pull_requests = [{'number': 4, 'state': 'open', 'head': 'eng/detection-add-fusion',
+                                     'html_url': 'https://github.com/team/detector/pull/4'}]
+        self.git('switch', '--quiet', '-c', 'eng/detection-add-fusion')
+        (self.repository / 'fusion.py').write_text('def fuse(scores):\n    return max(scores)\n')
+        self.git('add', '.')
+        self.commit_with_message('Detection: add fusion\n\nReviewed by NOBODY (OOPS!).\n\nFuses scores.\n\n* fusion.py: Added.')
+
+        result = self.run_sd1('pr')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('already had pull request', result.stdout)
+        self.assertEqual(FakeGitHub.requests[-1][:2], ('PATCH', '/repos/team/detector/pulls/4'))
 
     def test_missing_token_still_pushes_and_explains(self):
         (self.repository / 'a.py').write_text('a = 1\n')

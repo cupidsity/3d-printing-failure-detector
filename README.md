@@ -62,7 +62,21 @@ git-sd1 pr --draft    # open as a draft, allowed to still contain (OOPS!) lines
 git-sd1 pr --open     # also open it in the browser
 ```
 
-`pr` commits anything staged first. On a branch that already has its commit, the staged changes are folded into it with `git-sd1 amend`, so review fixes don't pile up as extra commits. Run from `main`, your commits move onto a new `eng/<title>` branch and `main` is reset to match `origin/main`. The branch is rebased onto the latest `main` and force-pushed, and the pull request title and description are rebuilt from the commit message on every run. Edit the commit message, not the description on GitHub.
+`pr` commits anything staged first. Every pull request starts from its own branch. On a branch that already has its commit, the staged changes are folded into it with `git-sd1 amend`, so review fixes don't pile up as extra commits. Run from `main`, your commits move onto a new `eng/<title>` branch and `main` is reset to match `origin/main`. The branch is rebased onto the latest `main` and force-pushed, and the pull request title and description are rebuilt from the commit message on every run. Edit the commit message, not the description on GitHub.
+
+#### Reused branch names
+
+A branch whose pull request is already closed has usually been landed, and pushing to it again hides new commits under a finished review. Before pushing, `pr` checks whether the branch it is about to use already had a pull request, and if it did, asks:
+
+```
+git-sd1: eng/detection-add-fusion already had pull request #4 (merged 2026-09-20), so this
+would be a second pull request from the same branch name.
+open another pull request from eng/detection-add-fusion anyway? [y/N]
+```
+
+Answer `y` to go ahead with that name. Answer `n` and it asks for another branch name to use instead (`eng/` is added if you leave it out), moves your commits there, and opens the pull request from that branch. Leave the name blank to stop: nothing is pushed, and commits that `pr` moved off `main` are put back on `main` exactly as they were.
+
+With no terminal to ask on, `pr` stops instead of guessing. Pass `--branch NAME` to pick a different branch or `--reuse-branch` to use the name anyway.
 
 `pr` needs a GitHub token that can create pull requests. It uses `GITHUB_TOKEN` (or `GH_TOKEN`) if set, and otherwise asks git for the token it already uses to push (your credential helper, or your editor's GitHub login). If you have more than one GitHub account, put your username in the remote (`https://<username>@github.com/...`) so the right token is picked. `pr` prints which account opened the pull request.
 

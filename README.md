@@ -8,10 +8,13 @@ Everything runs on a Raspberry Pi (or similar) next to the printer.
 
 | Path | Contents |
 | --- | --- |
-| `detection/` | image-processing detectors and the confidence fusion logic |
-| `printer/` | Moonraker client, printer commands, MQTT notifications |
-| `frontend/` | user-facing interface |
-| `pi/` | Raspberry Pi setup, services, deployment |
+| `heimdall/` | Plugin runtime |
+| `heimdall/detection/` | Image-processing detectors |
+| `heimdall/messaging/` | HTTP requests, MQTT notifications |
+| `instrumentor/` | Test data collection |
+| `frontend/` | User-facing interface |
+| `scripts/` | Raspberry Pi setup |
+
 ## Commits
 
 Significant commits follow this format:

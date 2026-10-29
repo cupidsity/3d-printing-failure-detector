@@ -3,16 +3,7 @@ import os
 import configparser
 from pathlib import Path
 
-# Prepare all relevant paths
-components_dir = Path.home() / "moonraker" / "moonraker" / "components"
-project_dir = Path(__file__).resolve().parent.parent
-
-moonraker_config_paths = [
-    Path("~/moonraker.conf").expanduser(),  # Default location
-    Path("~/printer_data/config/moonraker.conf").expanduser(),  # MainsailOS
-]
-
-os.chdir(project_dir)
+from .shared import components_dir, project_dir, get_moonraker_config_path
 
 
 def link_component(name: str):
@@ -21,39 +12,95 @@ def link_component(name: str):
     if not (components_dir / name).exists():
         print(f"Linking {name} to Moonraker's component folder")
         (components_dir / name).symlink_to(project_dir / name, target_is_directory=True)
+        print("Component linked!")
     else:
         print(f"{components_dir / name} already exists, skipping...")
 
 
-def append_config(name: str):
+def append_moonraker_config(name: str, moonraker_config_path: Path):
     # Create section in config file
-
-    for config_path in moonraker_config_paths:
-        if config_path.exists() and config_path.is_file():
-            break
-    else:
-        raise FileNotFoundError("Unable to find moonraker.conf")
-
     # todo: check with the user that it's the right location
 
     config = configparser.ConfigParser()
-    config.read(config_path)
+    config.read(moonraker_config_path)
 
     if config.has_section(name):
-        print(f"Entry for {name} already exists in {config_path}, skipping...")
+        print(
+            f"Entry for {name} already exists in {moonraker_config_path}, skipping..."
+        )
 
     else:
-        print(f"Creating entry in {config_path}")
+        print(f"Creating entry in {moonraker_config_path}")
         config.add_section(name)
-        with open(config_path, "w") as configfile:
+        with open(moonraker_config_path, "w") as configfile:
             config.write(configfile)
+        print("Entry created!")
+
+
+def generate_config(moonraker_config_path: Path):
+
+    print("Generating heimdall config...")
+    if (moonraker_config_path.parent / "heimdall.conf").exists():
+        print(
+            f"Merging with previous config at {(moonraker_config_path.parent / "heimdall.conf").as_posix()}"
+        )
+
+    # ConfigParser prefers keys from later entries, and silently ignores missing files
+    config = configparser.ConfigParser()
+    config.read(
+        [
+            project_dir / "scripts" / "default_config.conf",
+            moonraker_config_path.parent / "heimdall.conf",
+        ]
+    )
+
+    # Check if we need to ask about pausing
+    if "allow_pause" not in config["heimdall"]:
+
+        # See if klippy has pausing enabled
+        klippy_config = configparser.ConfigParser()
+        klippy_config.read(moonraker_config_path.parent / "printer.cfg")
+
+        if "pause_resume" in klippy_config:
+            print("Allow Heimdall to automatically pause failing prints? (Y/n)")
+            choice = input("> ")
+
+            if choice in ("n", "N", "no", "No", "NO"):
+                config["heimdall"]["allow_pause"] = "false"
+            else:
+                config["heimdall"]["allow_pause"] = "true"
+        else:
+            print(
+                "Pausing not configured in Klippy (printer.cfg). Heimdall will not automatically pause failing prints"
+            )
+            config["heimdall"]["allow_pause"] = "false"
+
+    with open(moonraker_config_path) as f:
+        config.write(f)
+
+    print(
+        f"Config file written to {(moonraker_config_path.parent / "heimdall.conf").as_posix()}"
+    )
 
 
 def install(name: str):
+    moonraker_config_path = get_moonraker_config_path()
     link_component(name)
-    append_config(name)
+    append_moonraker_config(name, moonraker_config_path)
 
-    print(f"{name} has been installed and will be loaded the next time Moonraker starts.")
+    # End instrumentor, that's all it needs
+    if name != "heimdall":
+        print(
+            f"{name} has been installed and will be loaded the next time Moonraker starts."
+        )
+        print("Moonraker can be restarted now with `sudo systemctl restart moonraker`")
+        return
+
+    generate_config(moonraker_config_path)
+
+    print(
+        f"{name} has been installed and will be loaded the next time Moonraker starts."
+    )
     print("Moonraker can be restarted now with `sudo systemctl restart moonraker`")
 
 

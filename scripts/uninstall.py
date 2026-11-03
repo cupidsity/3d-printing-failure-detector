@@ -3,16 +3,7 @@ import os
 import configparser
 from pathlib import Path
 
-# Prepare all relevant paths
-components_dir = Path.home() / "moonraker" / "moonraker" / "components"
-project_dir = Path(__file__).resolve().parent.parent
-
-moonraker_config_paths = [
-    Path("~/moonraker.conf"),  # Default location
-    Path("~/printer_data/config/moonraker.conf"),  # MainsailOS
-]
-
-os.chdir(project_dir)
+from .shared import components_dir, project_dir, get_moonraker_config_path
 
 
 def unlink_component(name: str):
@@ -21,30 +12,41 @@ def unlink_component(name: str):
     (components_dir / name).symlink_to(project_dir / name, target_is_directory=True)
 
 
-def remove_config(name: str):
+def remove_moonraker_config(name: str, moonraker_config_path: Path):
+    print(f"Removing entry in {moonraker_config_path}")
+
     # Remove section in config file
-
-    for config_path in moonraker_config_paths:
-        if config_path.exists() and config_path.is_file():
-            break
-    else:
-        raise FileNotFoundError("Unable to find moonraker.conf")
-
-    print(f"Removing entry in {config_path}")
-
     # todo: slightly change feedback when entry isn't present
 
     config = configparser.ConfigParser()
-    config.read(config_path)
+    config.read(moonraker_config_path)
     config.remove_section(name)
 
-    with open(config_path, "w") as configfile:
+    with open(moonraker_config_path, "w") as configfile:
         config.write(configfile)
 
 
+def remove_config(path: Path):
+    path.unlink()
+
+
 def uninstall(name: str):
+    moonraker_config_path = get_moonraker_config_path()
+
     unlink_component(name)
-    remove_config(name)
+    remove_moonraker_config(name, moonraker_config_path)
+
+    # End instrumentor, that's all it needs
+    if name != "heimdall":
+        print(
+            f"{name} has been uninstalled. Restart Moonraker to unload the running component"
+        )
+
+    remove_config(moonraker_config_path.parent / "heimdall.conf")
+
+    print(
+        f"{name} has been uninstalled. Restart Moonraker to unload the running component"
+    )
 
 
 if __name__ == "__main__":

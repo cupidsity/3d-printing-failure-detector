@@ -53,7 +53,9 @@ def install(name: str):
     link_component(name)
     append_config(name)
 
-    print(f"{name} has been installed and will be loaded the next time Moonraker starts.")
+    print(
+        f"{name} has been installed and will be loaded the next time Moonraker starts."
+    )
     print("Moonraker can be restarted now with `sudo systemctl restart moonraker`")
 
 

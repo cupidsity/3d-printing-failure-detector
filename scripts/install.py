@@ -12,6 +12,14 @@ moonraker_config_paths = [
     Path("~/printer_data/config/moonraker.conf").expanduser(),  # MainsailOS
 ]
 
+# nginx paths
+NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available/heimdall")
+NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled/heimdall")
+NGINX_CONFD = Path("/etc/nginx/conf.d")
+
+# path for static assets, like config templates
+STATIC_ASSETS = Path(__file__).resolve() / "assets"
+
 os.chdir(project_dir)
 
 
@@ -48,6 +56,19 @@ def append_config(name: str):
         with open(config_path, "w") as configfile:
             config.write(configfile)
 
+# 
+def create_nginx_config(port: str):
+    template_path = STATIC_ASSETS / "nginx_cfg"
+    template = template_path.read_text()
+
+    config = template.format(port = port)
+
+    NGINX_SITES_AVAILABLE.write(config)
+
+def enable_website():
+    if not NGINX_SITES_AVAILABLE.is_symlink() and symlink_path.exists():
+        raise FileExistsError(f"{symlink_path} already exists and is not a symlink")
+    NGINX_SITES_ENABLED.symlink_to(NGINX_SITES_AVAILABLE)
 
 def install(name: str):
     link_component(name)

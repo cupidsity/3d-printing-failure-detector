@@ -20,7 +20,6 @@ class Instrumentor:
 
         self.logger.info("Initialized")
 
-
     async def health_check(self, web_request: WebRequest):
         return {"state": "healthy"}
 

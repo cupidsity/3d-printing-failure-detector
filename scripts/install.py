@@ -1,6 +1,8 @@
 #!/bin/python
 import os
 import configparser
+import shutil
+import subprocess
 from pathlib import Path
 
 # Prepare all relevant paths
@@ -56,7 +58,33 @@ def append_config(name: str):
         with open(config_path, "w") as configfile:
             config.write(configfile)
 
-# 
+# helper function to check if any arbitrary package is installed
+def is_package_installed(package: str):
+    return shutl.which(package) is not None:
+
+def install_nginx():
+    if(is_package_installed("nginx")):
+        print("nginx already installed")
+        return
+
+    print("install nginx: this will ask for root")
+    try:
+        subprocess.run(["sudo", "apt-get", "update"], check=True)
+        subprocess.run(["sudo", "apt-get", "install", "-y", "nginx"], check=True)
+        print("succesfully installed nginx")
+        return True
+
+     except subprocess.CalledProcessError as e:
+        print(f"err: failed to install nginx (code {e.returncode})")
+        print(f"err: {e.stderr}")
+        return False
+
+    except FileNotFoundError:
+        print("err: could not find apt. If you're not on Debian, please install nginx manually")
+        return False
+
+
+# create nginx config from a template stored in ~/scripts/assets/nginx_cfg
 def create_nginx_config(port: str):
     template_path = STATIC_ASSETS / "nginx_cfg"
     template = template_path.read_text()

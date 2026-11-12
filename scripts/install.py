@@ -100,7 +100,7 @@ def enable_website():
 
 def restart_nginx():
     try:
-        subprocess.run(["sudo", "systemctl", "restart", "moonraker"], check=True)
+        subprocess.run(["sudo", "systemctl", "restart", "nginx"], check=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f"err: failed to restart nginx (code {e.returncode})")

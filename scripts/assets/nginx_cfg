@@ -1,11 +1,11 @@
 server {
-    listen 80
+    listen {port}
     listen [::]:{port};
 
     server_name localhost;
 
-    # Path to your static files directory
-    root /var/www/html;
+    # todo: check how frontend is going to be deployed
+    root /home/mks/heimdall/frontend;
     index index.html index.htm;
 
     location / {

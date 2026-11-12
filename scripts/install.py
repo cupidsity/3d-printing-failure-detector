@@ -64,10 +64,10 @@ def is_package_installed(package: str):
 
 def install_nginx():
     if(is_package_installed("nginx")):
-        print("nginx already installed")
-        return
+        print("nginx already installed, not installing")
+        return True
 
-    print("install nginx: this will ask for root")
+    print("installing nginx: this will ask for root")
     try:
         subprocess.run(["sudo", "apt-get", "update"], check=True)
         subprocess.run(["sudo", "apt-get", "install", "-y", "nginx"], check=True)
@@ -98,12 +98,39 @@ def enable_website():
         raise FileExistsError(f"{symlink_path} already exists and is not a symlink")
     NGINX_SITES_ENABLED.symlink_to(NGINX_SITES_AVAILABLE)
 
+def restart_nginx():
+    try:
+        subprocess.run(["sudo", "systemctl", "restart", "moonraker"], check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"err: failed to restart nginx (code {e.returncode})")
+        print(f"err: {e.stderr}")
+        return False
+
 def install(name: str):
     link_component(name)
     append_config(name)
 
     print(f"{name} has been installed and will be loaded the next time Moonraker starts.")
     print("Moonraker can be restarted now with `sudo systemctl restart moonraker`")
+
+
+    print("Setting up nginx")
+    # install nginx, quit early if it fails
+    if(install_nginx() == False):
+        print("Failed to install nginx")
+        return
+    
+    # get port to setup nginx config
+    port = input("Enter port (default=1223): ")
+    while not value.isnumeric():
+        print("not a number, try again")
+        port = input("Enter port (default=1223): ")
+    create_nginx_config(port=port)
+
+    enable_website()
+    restart_nginx()
+
 
 
 if __name__ == "__main__":

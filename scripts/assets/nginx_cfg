@@ -1,0 +1,14 @@
+server {
+    listen {port}
+    listen [::]:{port};
+
+    server_name localhost;
+
+    # todo: check how frontend is going to be deployed
+    root /home/mks/heimdall/frontend;
+    index index.html index.htm;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}

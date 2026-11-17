@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .shared import components_dir, project_dir, get_moonraker_config_path
 # nginx paths
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available/heimdall")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled/heimdall")

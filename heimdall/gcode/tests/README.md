@@ -5,7 +5,7 @@ Run these commands from the repository root after completing the setup in the pa
 ## 1. Parser smoke test
 
 ```powershell
-python -m heimdall.gcode.manual_tests.smoke_test
+python -m heimdall.gcode.tests.smoke_test
 ```
 
 Expected output:
@@ -19,7 +19,7 @@ A nonzero exit, traceback, a different segment/layer count, or warnings means th
 ## 2. Cache behavior
 
 ```powershell
-python -m heimdall.gcode.manual_tests.cache_check
+python -m heimdall.gcode.tests.cache_check
 ```
 
 Expected output consists of four `PASS` lines confirming the first miss, repeated hit with skipped parsing, memory mapping, and changed-input invalidation.

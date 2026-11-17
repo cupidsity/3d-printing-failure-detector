@@ -31,8 +31,7 @@ Unsupported commands are skipped with bounded warnings. Non-XY arcs are currentl
 | `cache.py` | Versioned artifacts, validation, atomic writes, and memory mapping |
 | `diagnostics.py` | Lightweight top-down SVG layer preview |
 | `cli.py` | Parse, preview, and cache-clear commands |
-| `tests/` | Automated unit, integration, invariant, and cache tests |
-| `manual_tests/` | User-runnable checks and benchmark |
+| `tests/` | User-runnable checks and benchmark |
 | `fixtures/` | Small Cura, PrusaSlicer, and malformed-input samples |
 
 Each segment is a 54-byte structured record containing start/end XYZ, extrusion delta, bead width/height, normalized layer, tool, feature ID, derivation flags, and the source command's ending byte offset. Retractions and primes use a separate compact event array.
@@ -108,18 +107,6 @@ python3 -m heimdall.gcode clear-cache --cache-dir /path/to/cache
 ```
 
 Do not manually edit cache metadata. It is safe to clear generated cache data; the next parse recreates it from the original G-code.
-
-## Automated tests
-
-From the repository root:
-
-```bash
-python3 -m unittest discover -s heimdall/gcode/tests -v
-```
-
-The suite verifies positioning equivalence, extrusion modes and resets, travel/retraction suppression, Z-hop handling, Cura/Prusa metadata, arc endpoint and chord error, byte lookup, malformed input warnings, SVG output, cache creation, memory-mapped reuse, configuration invalidation, content invalidation, and cache clearing.
-
-See [`manual_tests/README.md`](manual_tests/README.md) for checks that can be run on a development computer or Raspberry Pi.
 
 ## Troubleshooting
 

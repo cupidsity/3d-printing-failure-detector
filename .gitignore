@@ -36,3 +36,18 @@ captures/
 # logs
 *.log
 logs/
+
+
+# g-code parser, diagnostic, and test-generated output
+.heimdall-gcode-cache/
+heimdall/gcode/**/.cli-cache/
+heimdall/gcode/**/cache/
+heimdall/gcode/**/.building-*/
+heimdall/gcode/tests/tmp*/
+heimdall/gcode/**/events.npy
+heimdall/gcode/**/layer_offsets.npy
+heimdall/gcode/**/segments.npy
+heimdall/gcode/**/index.json
+heimdall/gcode/**/index.json.tmp
+heimdall/gcode/**/metadata.json
+heimdall/gcode/**/*.svg

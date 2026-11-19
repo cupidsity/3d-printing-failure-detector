@@ -1,9 +1,20 @@
 #!/bin/python
 import os
 import configparser
+import shutil
+import subprocess
 from pathlib import Path
 
 from .shared import components_dir, project_dir, get_moonraker_config_path
+# nginx paths
+NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available/heimdall")
+NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled/heimdall")
+NGINX_CONFD = Path("/etc/nginx/conf.d")
+
+# path for static assets, like config templates
+STATIC_ASSETS = Path(__file__).resolve() / "assets"
+
+os.chdir(project_dir)
 
 
 def link_component(name: str):
@@ -82,6 +93,54 @@ def generate_config(moonraker_config_path: Path):
         f"Config file written to {(moonraker_config_path.parent / "heimdall.conf").as_posix()}"
     )
 
+# helper function to check if any arbitrary package is installed
+def is_package_installed(package: str):
+    return shutl.which(package) is not None:
+
+def install_nginx():
+    if(is_package_installed("nginx")):
+        print("nginx already installed, not installing")
+        return True
+
+    print("installing nginx: this will ask for root")
+    try:
+        subprocess.run(["sudo", "apt-get", "update"], check=True)
+        subprocess.run(["sudo", "apt-get", "install", "-y", "nginx"], check=True)
+        print("succesfully installed nginx")
+        return True
+
+     except subprocess.CalledProcessError as e:
+        print(f"err: failed to install nginx (code {e.returncode})")
+        print(f"err: {e.stderr}")
+        return False
+
+    except FileNotFoundError:
+        print("err: could not find apt. If you're not on Debian, please install nginx manually")
+        return False
+
+
+# create nginx config from a template stored in ~/scripts/assets/nginx_cfg
+def create_nginx_config(port: str):
+    template_path = STATIC_ASSETS / "nginx_cfg"
+    template = template_path.read_text()
+
+    config = template.format(port = port)
+
+    NGINX_SITES_AVAILABLE.write(config)
+
+def enable_website():
+    if not NGINX_SITES_AVAILABLE.is_symlink() and symlink_path.exists():
+        raise FileExistsError(f"{symlink_path} already exists and is not a symlink")
+    NGINX_SITES_ENABLED.symlink_to(NGINX_SITES_AVAILABLE)
+
+def restart_nginx():
+    try:
+        subprocess.run(["sudo", "systemctl", "restart", "nginx"], check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"err: failed to restart nginx (code {e.returncode})")
+        print(f"err: {e.stderr}")
+        return False
 
 def install(name: str):
     moonraker_config_path = get_moonraker_config_path()
@@ -102,6 +161,24 @@ def install(name: str):
         f"{name} has been installed and will be loaded the next time Moonraker starts."
     )
     print("Moonraker can be restarted now with `sudo systemctl restart moonraker`")
+
+
+    print("Setting up nginx")
+    # install nginx, quit early if it fails
+    if(install_nginx() == False):
+        print("Failed to install nginx")
+        return
+    
+    # get port to setup nginx config
+    port = input("Enter port (default=1223): ")
+    while not value.isnumeric():
+        print("not a number, try again")
+        port = input("Enter port (default=1223): ")
+    create_nginx_config(port=port)
+
+    enable_website()
+    restart_nginx()
+
 
 
 if __name__ == "__main__":

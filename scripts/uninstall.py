@@ -5,6 +5,11 @@ from pathlib import Path
 
 from .shared import components_dir, project_dir, get_moonraker_config_path
 
+from .shared import NGINX_CONFD, NGINX_SITES_AVAILABLE, NGINX_SITES_ENABLED
+
+# todo: might move to shared
+from .install import restart_nginx
+
 
 def unlink_component(name: str):
     # Remove the component
@@ -30,7 +35,19 @@ def remove_config(path: Path):
     path.unlink()
 
 
+def uninstall_web():
+    remove_config(NGINX_SITES_ENABLED)
+    os.remove(NGINX_SITES_AVAILABLE)
+    restart_nginx()
+
 def uninstall(name: str):
+    if(name.equals("web")):
+        uninstall_web()
+        print(f"{name} has been uninstalled")
+        print("nginx is still installed, but can be removed with sudo apt remove nginx")
+        print("or the equivalent of your system's package manager")
+        return
+
     moonraker_config_path = get_moonraker_config_path()
 
     unlink_component(name)
@@ -55,7 +72,7 @@ if __name__ == "__main__":
     # todo: better argument handling, perhaps with argparse
     name = sys.argv[1] if 1 < len(sys.argv) else "heimdall"
 
-    if name not in ("heimdall", "instrumentor"):
+    if name not in ("heimdall", "instrumentor", "web"):
         print(f"Invalid component {name}", file=sys.stderr)
 
     uninstall(name)
